@@ -22,10 +22,7 @@ add_compile_definitions(PLUGIN_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 # CommonLibSSE-NG resolves game addresses and struct layouts at runtime, so one DLL serves
 # every supported runtime. SE and AE are both enabled - AE here covers the 1.7.x releases
 # (1.7.99 and 1.7.104, which need Address Library format 5 and SKSE 2.3.x) as well as the
-# older 1.6.x ones. VR is on: the plugin's two engine offsets (CreateTriShapeRendererData,
-# GeometryBufferManager) are bit-for-bit identical on VR and already published in the VR
-# Address Library (>=0.266.0), and its one hook (BSLightingShader::SetupGeometry) resolves
-# through CommonLibVR's own vetted VR vtable offset.
+# older 1.6.x ones.
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ENABLE_SKYRIM_SE ON CACHE BOOL "" FORCE)
 set(ENABLE_SKYRIM_AE ON CACHE BOOL "" FORCE)
