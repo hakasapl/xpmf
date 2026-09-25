@@ -68,18 +68,6 @@ auto skyCellOf(const RE::TESWorldSpace* world) -> RE::TESObjectCELL*
 }
 
 /**
- * @brief Whether a material was ever projected onto a shape
- *
- * Clone3D (and Seasons of Skyrim) write the material's color with an alpha of 1 next to setting
- * Projected_UV; a shape this plugin switched off keeps the color, so the alpha says so for good.
- */
-auto wasProjectedOnto(const RE::BSLightingShaderProperty& shader) -> bool
-{
-    constexpr float PROJECTED_ALPHA = 1.0F;
-    return shader.projectedUVColor.alpha == PROJECTED_ALPHA;
-}
-
-/**
  * @brief Calls visit on every leaf object under a root, depth first, looking at no more than
  * budget objects
  *
@@ -429,14 +417,15 @@ auto ProjectedGeometry::dressWinterSnow(RE::NiAVObject& root,
     if (s_winterSnow == nullptr || !SeasonsOfSkyrim::hasWinterSnow(root)) {
         return false;
     }
-    adoptWinterSnow(root);
+    adoptWinterSnow(root, false); // a loader thread, and a fresh clone: none of it is on the list yet
     if (const auto* const treatment = withGeometry(s_winterSnow->second); treatment != nullptr) {
         dressClone(root, settingsOf(*treatment, base));
     }
     return true;
 }
 
-void ProjectedGeometry::adoptWinterSnow(RE::NiAVObject& root)
+void ProjectedGeometry::adoptWinterSnow(RE::NiAVObject& root,
+                                        bool switchedOffToo)
 {
     const auto& [material, treatment] = *s_winterSnow;
     if (treatment.untouched) {
@@ -446,10 +435,10 @@ void ProjectedGeometry::adoptWinterSnow(RE::NiAVObject& root)
     // Seasons of Skyrim projects a copy of the record's color and falloff values that it took
     // before MaterialMatcher gave the record the profile's (see SeasonsOfSkyrim). Both are read
     // from the shader property at every draw, so writing them is all it takes - to every shape the
-    // snow was ever projected onto (alpha 1, see collectReference), one this plugin switched off
-    // included. The falloff values only where the profile overrides one: the property holds
-    // (scale, bias, 1 / noise UV scale, cos(max angle)) the way Clone3D and Seasons of Skyrim
-    // write it, and the angle is the static's own
+    // snow is on and, on the main thread, every shape it was on until this plugin switched it off
+    // (s_switchedOff), which wants the color for when it comes back. The falloff values only where
+    // the profile overrides one: the property holds (scale, bias, 1 / noise UV scale, cos(max
+    // angle)) the way Clone3D and Seasons of Skyrim write it, and the angle is the static's own
     const auto& data = material->directionalData;
     const RE::NiColor& color = data.singlePassColor;
     const bool falloff = treatment.profile->overridesFalloff();
@@ -458,7 +447,12 @@ void ProjectedGeometry::adoptWinterSnow(RE::NiAVObject& root)
         auto* const shader = geometry != nullptr
             ? netimmerse_cast<RE::BSLightingShaderProperty*>(geometry->GetGeometryRuntimeData().shaderProperty.get())
             : nullptr;
-        if (shader == nullptr || !wasProjectedOnto(*shader)) {
+        if (shader == nullptr) {
+            return;
+        }
+        const bool snowed = shader->flags.any(ShaderFlag::kProjectedUV)
+            || (switchedOffToo && s_switchedOff.contains(geometry->AsTriShape()));
+        if (!snowed) {
             return;
         }
         shader->projectedUVColor.red = color.red;
@@ -672,6 +666,13 @@ void ProjectedGeometry::apply(const Swap& swap)
         shader->SetFlags(Flag8::kSnow, projected && swap.isSnow);
         changed = true;
     }
+    // Which shapes are switched off is remembered here and nowhere else: nothing on the property
+    // says so (see collectReference)
+    if (projected) {
+        s_switchedOff.erase(&shape);
+    } else {
+        s_switchedOff.try_emplace(&shape, swap.shape);
+    }
 
     // A variant always has colors worth showing (white wherever the mesh had none); a shape whose
     // shader ignored them has to be told to look, and told to stop once the variant is gone
@@ -749,8 +750,10 @@ void ProjectedGeometry::slice()
 
     if (now >= s_nextGarbage) {
         ProjectedVertexData::collectGarbage();
-        // An alpha property only this registry still holds belongs to a shape that is gone
+        // An alpha property only this registry still holds belongs to a shape that is gone, and a
+        // shape only the switched-off list still holds is gone itself
         std::erase_if(s_alphaTests, [](const auto& item) -> bool { return item.second.property->GetRefCount() <= 1; });
+        std::erase_if(s_switchedOff, [](const auto& item) -> bool { return item.second->GetRefCount() <= 1; });
         s_nextGarbage = now + K_GARBAGE_INTERVAL;
     }
 
@@ -1092,7 +1095,7 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
     const auto* const stat = base->As<RE::TESObjectSTAT>();
     const bool winterSnow = s_winterSnow != nullptr && SeasonsOfSkyrim::hasWinterSnow(*root);
     if (winterSnow) {
-        adoptWinterSnow(*root); // done at Clone3D already, unless its hooks ran after this plugin's
+        adoptWinterSnow(*root, true); // done at Clone3D already, unless its hooks ran after this plugin's
     }
     const auto* const treatment = winterSnow ? withGeometry(s_winterSnow->second)
         : stat != nullptr                    ? treatmentOf(stat->data.materialObj)
@@ -1130,11 +1133,17 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         // is one this plugin sheltered earlier - still a receiver, it may be in the open by now
         const bool colorsEnabled = shape->shader->flags.any(ShaderFlag::kVertexColors)
             && !ProjectedVertexData::isForColorlessShape(shape->data);
-        // ...provided the engine really did project onto it: Clone3D writes the color with an alpha
-        // of 1 next to setting the flag, and switching projection back on over parameters nobody
-        // ever wrote would cover the shape in black
+        // ...provided the engine really did project onto it, which with the flag off means this
+        // plugin switched it off. Only the list says so. The projection color's alpha, which Clone3D
+        // writes as 1, used to stand in for it and cannot: BSLightingShaderProperty's constructor
+        // gives every property the color (0.6, 0.7, 0.8, 1), so the blood and dirt decals the engine
+        // builds onto a static's shapes after the clone - fresh properties, under a BGSDecalNode in
+        // its scene graph, which Clone3D's material pass (it takes every lighting property under the
+        // root; the decals were not there yet) never saw - looked projected onto too, and were
+        // switched on over the constructor's zero parameters: the whole decal under a flat patch of
+        // the game's projected diffuse, on top of the blood
         const bool everProjected
-            = shape->shader->flags.any(ShaderFlag::kProjectedUV) || wasProjectedOnto(*shape->shader);
+            = shape->shader->flags.any(ShaderFlag::kProjectedUV) || s_switchedOff.contains(shape->shape);
         const bool receives = snowed && (colorsEnabled || settings.shelter) && everProjected;
         if (!receives) {
             return;

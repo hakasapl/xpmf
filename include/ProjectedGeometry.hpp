@@ -71,7 +71,9 @@ namespace XPMF {
  *    keeps the shared variant, partly covered -> a private variant whose alpha fades with the
  *    distance under cover, sheltered -> its projected snow is switched off (the Projected_UV
  *    and Snow shader flags the engine set in Clone3D are cleared again) and it goes back to the
- *    model's own vertex data. That switch is also all that can be done for a shape whose vertex
+ *    model's own vertex data - and onto a list (s_switchedOff), since the next gather has to take
+ *    it for a receiver still, and nothing on the property tells it from a shape the engine never
+ *    projected onto. That switch is also all that can be done for a shape whose vertex
  *    alpha is already spoken for - a blended overlay, an alpha tested cutout - where lowering
  *    alpha would make the shape itself fade or vanish: such a shape loses its snow as a whole
  *    once half of what could hold snow on it is under cover.
@@ -405,8 +407,12 @@ private:
      * @brief Gives the shapes under a root Seasons of Skyrim snowed on the projection color its
      * record has now, which makes their draws the profile's, and the falloff values the profile
      * overrides (see SeasonsOfSkyrim)
+     *
+     * @param switchedOffToo Whether shapes this plugin switched off (s_switchedOff) get them as
+     *        well; true on the main thread only, which alone may read that list
      */
-    static void adoptWinterSnow(RE::NiAVObject& root);
+    static void adoptWinterSnow(RE::NiAVObject& root,
+                                bool switchedOffToo);
 
     /**
      * @brief What a shape has to be for this plugin to touch or read it
@@ -554,6 +560,16 @@ private:
 
     // Main thread only
     static inline std::unordered_map<const RE::NiAlphaProperty*, ScaledAlphaTest> s_alphaTests;
+    /**
+     * @brief The shapes whose projection this plugin switched off (apply), pinned so that their
+     * addresses stay their own
+     *
+     * A receiver the next gather would otherwise not recognize: its Projected_UV flag is off, and
+     * its projection color - all Clone3D leaves behind - is nothing to go by, since the engine's
+     * property constructor gives every property one, alpha 1 included (see collectReference).
+     * Entries whose shape is gone are dropped with the other garbage.
+     */
+    static inline std::unordered_map<const RE::BSTriShape*, RE::NiPointer<RE::BSTriShape>> s_switchedOff;
     static inline std::unordered_map<CellKey, Cell> s_cells;
     static inline std::optional<Gather> s_gather;
     static inline std::vector<Occluder> s_retiredOccluders;
