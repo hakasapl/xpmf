@@ -300,7 +300,7 @@ public:
      * @brief A key that is no setting but has every right to be there - "$schema" for an editor,
      * "comment" for a person - so that nobody warns about it either
      */
-    void allowed(const char* key) { find(key, false); }
+    void allowed(const char* key) { static_cast<void>(find(key, false)); } // looked up, which is all it takes
 
     /**
      * @brief Keys nothing asked for. Not a reason to reject a file, but worth a warning: in a hand
