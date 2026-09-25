@@ -116,7 +116,7 @@
             "minimum": 0,
             "maximum": 10,
             "default": null,
-            "description": "What the specular strength of every shape the projection is on is multiplied by, on a copy of the shape's material: 0 takes the highlight off, 1 leaves it. Without the Snow flag the shader lights covered pixels with the mesh's own specular, which is how a glossy mesh makes glossy snow; with the flag it uses the snow rim light instead. null or absent = as the mesh has it."
+            "description": "What the specular strength of every shape the projection is on is multiplied by, on a copy of the shape's material: 0 takes the highlight off, 1 leaves it. Without the Snow flag the shader lights covered pixels with the mesh's own specular, which is how a glossy mesh makes glossy snow; with the flag it uses the snow rim light instead. Not applied to Community Shaders' True PBR materials, which keep their roughness scale in that field; PBR snow takes its roughness and specular from CS's PBRMaterialObjects configuration. null or absent = as the mesh has it."
         }
     },
     "definitions": {

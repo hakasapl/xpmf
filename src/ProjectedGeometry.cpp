@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -65,6 +66,27 @@ auto skyCellOf(const RE::TESWorldSpace* world) -> RE::TESObjectCELL*
         world = world->parentWorld;
     }
     return world != nullptr ? world->skyCell : nullptr;
+}
+
+/**
+ * @brief Whether an object is of one of the game's own classes: its vtable lies in the game module
+ *
+ * Another plugin's subclass keeps its vtable in that plugin's DLL. Community Shaders' True PBR
+ * gives a PBR shape a lighting material of a class of its own, in which the inherited fields
+ * mean other things - specularColorScale is its roughness scale, specularPower its specular
+ * level, rimLightPower its displacement scale - so such a material is not this plugin's to
+ * scale: a specularMult of 0 made every snowed PBR rock a mirror.
+ */
+auto isGameClass(const void* object) -> bool
+{
+    const auto vtable = *static_cast<const std::uintptr_t*>(object);
+    HMODULE module = nullptr;
+    const bool found
+        = ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(vtable), // NOLINT: the API takes an address
+                               &module)
+        != 0;
+    return found && reinterpret_cast<std::uintptr_t>(module) == REL::Module::get().base();
 }
 
 /**
@@ -508,6 +530,14 @@ void ProjectedGeometry::scaleSpecular(RE::BSLightingShaderProperty& shader,
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     auto* const material = static_cast<RE::BSLightingShaderMaterialBase*>(shader.material);
     if (material == nullptr) {
+        return;
+    }
+    if (!isGameClass(material)) {
+        static std::atomic<bool> loggedForeign {false};
+        if (!loggedForeign.exchange(true)) {
+            spdlog::info("specularMult leaves materials of another plugin's class as they are (Community Shaders' True "
+                         "PBR keeps its roughness scale in the specular field); the first such material was just met");
+        }
         return;
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)

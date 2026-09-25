@@ -119,8 +119,9 @@ public:
                                               highlight off, 1 leaves it. Without the Snow flag the shader lights
                                               covered pixels with the mesh's own specular, which is how a glossy
                                               mesh makes glossy snow; with the flag it swaps in the snow rim
-                                              light instead (bEnableSnowRimLighting). std::nullopt = as the mesh
-                                              has it */
+                                              light instead (bEnableSnowRimLighting). Not applied to Community
+                                              Shaders' PBR materials, whose roughness scale lives in that field.
+                                              std::nullopt = as the mesh has it */
 
         /**
          * @brief The name with the file it came from: two files may well share a name

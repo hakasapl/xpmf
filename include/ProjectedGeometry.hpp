@@ -39,8 +39,10 @@ namespace XPMF {
  * neutralizeVertexAlphaSkip, roofShelterSkip: a mesh whose colors or mask are wanted as they
  * are, a porch that is to stay snowed under its roof), see settingsOf. A fourth setting, specularMult,
  * scales the specular strength of the shapes the projection is on, since the shader lights a
- * covered pixel with the mesh's own specular unless the material carries the Snow flag. "Snow"
- * below stands for any of them.
+ * covered pixel with the mesh's own specular unless the material carries the Snow flag - on the
+ * game's own materials only: Community Shaders' PBR materials keep their roughness scale in that
+ * field, and their projected snow takes roughness and specular from CS's material object
+ * configuration instead (scaleSpecular). "Snow" below stands for any of them.
  *
  * The first pass happens inside TESBoundObject::Clone3D, hooked through TESObjectSTAT's vtable
  * (slot 0x40; statics are the only forms the engine applies a material object to). The engine
@@ -382,6 +384,8 @@ private:
      * not, so the shape is given a material of its own first (the way po3's Papyrus Extender
      * swaps materials: a copy handed to SetMaterial, which copies it once more into one the
      * property owns). The shader reads the strength at every draw, so nothing is set up again.
+     * A material of a class the game does not own - Community Shaders' PBR material, whose
+     * roughness scale lives in the field - is left as it is.
      *
      * @param factor The profile's specularMult: 1 leaves the strength as it is
      */
