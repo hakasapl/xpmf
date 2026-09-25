@@ -19,6 +19,5 @@
         "BDS_FarmLumbermill01Snow"
     ],
     "roofShelter": true,
-    "shelterFade": 64,
-    "specularMult": 0
+    "shelterFade": 64
 }
