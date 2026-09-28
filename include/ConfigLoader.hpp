@@ -51,7 +51,7 @@ public:
      * The settings fall into the plugin's three independent parts - patching the material (the
      * four textures, isSnow, the three falloff values and maxAngle, each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
-     * shelterFade) - and any combination
+     * shelterFade and roofShelterFixVertices) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
      * over the EditorIDs of the statics (base records) it is not applied to. A fourth, specularMult,
      * scales the specular strength of the shapes the projection is on.
@@ -113,6 +113,10 @@ public:
                                 cover */
         std::vector<std::string> roofShelterSkip; /**< Same, for the statics whose shapes stay covered under a
                                                      roof */
+        bool roofShelterFixVertices {}; /**< Whether a shape partly under cover gets vertices added where the
+                                           cover changes, so that a mesh too coarse to carry the fade (a floor
+                                           of long planks) follows the drip line all the same
+                                           (ShelterRefinement); only ever with roofShelter */
         float shelterFade {}; /**< World units over which it fades out under cover */
         std::optional<float> specularMult; /**< What the specular strength of every shape the projection is on
                                               is multiplied by, on a copy of the shape's material: 0 takes the
@@ -226,6 +230,7 @@ private:
                                                                      cover; a mask painted for the game's own
                                                                      projection is in its way */
     constexpr static bool DEFAULT_ROOF_SHELTER = true;
+    constexpr static bool DEFAULT_ROOF_SHELTER_FIX_VERTICES = true; /**< Game meshes are coarse where it counts */
     constexpr static float DEFAULT_SHELTER_FADE = 64.0F; /**< About how far wind carries snow in under an eave */
     constexpr static double MAX_ANGLE_LIMIT = 180.0; /**< cos(angle) is what the shader compares with; at 180 every
                                                         face is covered and past it there is nothing to say */

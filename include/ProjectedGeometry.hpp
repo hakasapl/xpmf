@@ -3,6 +3,7 @@
 #include "ConfigLoader.hpp"
 #include "ProjectedVertexData.hpp"
 #include "ShelterMap.hpp"
+#include "ShelterRefinement.hpp"
 #include "VertexLayout.hpp"
 
 #include "PCH.h"
@@ -71,7 +72,9 @@ namespace XPMF {
  *    judgement waits for its own roofs only, its neighbors' coming in over the next seconds and a
  *    second pass following them; every later one waits for the whole neighborhood. In the open ->
  *    keeps the shared variant, partly covered -> a private variant whose alpha fades with the
- *    distance under cover, sheltered -> its projected snow is switched off (the Projected_UV
+ *    distance under cover (and, with the profile's roofShelterFixVertices, with the vertices
+ *    ShelterRefinement adds where the mesh is too coarse to carry that fade), sheltered -> its
+ *    projected snow is switched off (the Projected_UV
  *    and Snow shader flags the engine set in Clone3D are cleared again) and it goes back to the
  *    model's own vertex data - and onto a list (s_switchedOff), since the next gather has to take
  *    it for a receiver still, and nothing on the property tells it from a shape the engine never
@@ -342,6 +345,8 @@ private:
         bool neutralizeColors {}; /**< Its shapes get white vertex colors */
         bool neutralizeAlpha {}; /**< Its shapes start from a vertex alpha of 1 */
         bool shelter {}; /**< Its shapes lose the projection under cover */
+        bool fixVertices {}; /**< Its shapes partly under cover get vertices where the cover changes
+                                (ShelterRefinement); only ever with shelter */
         std::optional<float> specularMult; /**< What its shapes' specular strength is multiplied by; std::nullopt
                                               leaves it (no skip list: the profile's own value or nothing) */
     };
@@ -424,11 +429,12 @@ private:
     struct ShapeView {
         RE::BSTriShape* shape {};
         RE::BSLightingShaderProperty* shader {};
-        Data* data {};
-        VertexLayout layout;
-        std::uint32_t vertexCount {};
+        Data* data {}; /**< What the shape draws with now: the model's data or a variant of it */
+        std::uint32_t vertexCount {}; /**< The model's counts, whatever a refined variant on the shape draws */
         std::uint32_t triangleCount {};
         bool keepAlpha {}; /**< See ProjectedVertexData::Shape::keepAlpha */
+        bool refinable {}; /**< A plain tri shape, whose triangle list may be traded for a longer one: not a mesh
+                              LOD tri shape, which draws a prefix of its list per level */
         RE::NiAlphaProperty* alphaTest {}; /**< The shape's alpha property when its alpha is tested against a
                                               threshold and nothing else, and the mesh paints none: such a shape
                                               is masked like any other, with the threshold scaled to match (see
@@ -526,22 +532,19 @@ private:
     [[nodiscard]] static auto run(ReceiverJob& job) -> ReceiverResult;
 
     /**
-     * @brief Per vertex openness of one receiver: its vertices put into world space and handed to
-     * ShelterMap::Field::measureOpenness, which has the details
+     * @brief The world space positions of a receiver's vertices
      *
-     * @param normals World space vertex normals, or empty for a mesh without them
-     * @param edgeOpenness Openness at which snow visibly ends on a flat surface of this static
-     * @param positions Scratch buffer for the world space positions
-     * @param openness Out: the result
-     * @return bool Whether any vertex is under cover
+     * @param positions Out: one per vertex of the model's shape
      */
-    [[nodiscard]] static auto measureOpenness(const Receiver& receiver,
-                                              const ShelterMap::Field& field,
-                                              const VertexLayout& layout,
-                                              std::span<const RE::NiPoint3> normals,
-                                              float edgeOpenness,
-                                              std::vector<RE::NiPoint3>& positions,
-                                              std::vector<float>& openness) -> bool;
+    static void worldPositions(const Receiver& receiver,
+                               const VertexLayout& layout,
+                               std::vector<RE::NiPoint3>& positions);
+
+    /**
+     * @brief How far ShelterRefinement may go on one shape: its own vertex count again at most
+     * (a coarse mesh needs proportionally more, a fine one nothing), within what a BSTriShape counts
+     */
+    [[nodiscard]] static auto refinementLimits(std::uint32_t vertexCount) -> ShelterRefinement::Limits;
 
     [[nodiscard]] static auto keyOf(int cellX,
                                     int cellY) -> CellKey;
@@ -589,6 +592,13 @@ private:
     static inline std::deque<Result> s_results;
     static inline std::vector<CellKey> s_touched; /**< Cells a static was cloned into (from the hook) */
     static inline bool s_workerStarted = false;
+
+    // What the vertex fix has done, for the log: counted on the worker, read on the main thread
+    static inline std::atomic<std::size_t> s_refinedBuilds {0}; /**< Refined variants built */
+    static inline std::atomic<std::size_t> s_refinedVertices {0}; /**< Vertices they added in all */
+    static inline std::atomic<std::size_t> s_refinedTriangles {0}; /**< Triangles they added in all */
+    static inline std::atomic<std::size_t> s_refinedProbes {0}; /**< Field lookups the refinement spent in all */
+    static inline std::size_t s_loggedRefinedBuilds = 0; /**< s_refinedBuilds as of the last log line; main thread */
 
     static inline std::atomic<bool> s_gridChanged {true}; /**< Set by the sink */
     static inline std::atomic<bool> s_loading {false}; /**< Whether a loading screen is up (read in slice): the

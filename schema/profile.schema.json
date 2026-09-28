@@ -104,6 +104,11 @@
             "$ref": "#/definitions/patternListOrNull",
             "description": "Patterns over the EditorIDs of the statics whose shapes stay covered under a roof. None by default."
         },
+        "roofShelterFixVertices": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether a shape partly under cover is given extra vertices where the cover changes. The shelter reaches the shader through vertex alpha, which runs straight between two vertices, and game meshes are coarse where it counts: a walkway floor is a row of planks with a vertex at either end, so the fade is interpolated across the whole bay, a wedge of snow reaching in under the eave. With this on, XPMF splits, on its worker thread, the edges of such triangles where the interpolation is visibly off - along the drip line and through the fade, nowhere else, the way hand-fixed meshes place their loops - and gives the shape a vertex buffer with those vertices. Only shapes that turn out partly covered are touched; a shape whose vertex alpha is transparency, or that draws LOD prefixes of its triangles, is left as it is. Does nothing without roofShelter."
+        },
         "shelterFade": {
             "type": "number",
             "minimum": 0,

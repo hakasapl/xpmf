@@ -1,0 +1,121 @@
+#pragma once
+
+#include "ShelterMap.hpp"
+
+#include "PCH.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <vector>
+
+namespace XPMF {
+
+/**
+ * @brief Puts vertices where the cover changes on a mesh too coarse to follow it
+ *
+ * The shelter reaches the pixel shader through vertex alpha and nothing else, so between two
+ * vertices it can only ever be a straight line. Game meshes are built for anything but: a
+ * covered walkway's floor is a row of planks that run from one eave to the other with a vertex
+ * at either end, so whatever alpha those ends get, the plank interpolates it across the whole
+ * bay - a wedge of snow reaching in under the roof, or a floor stripped bare to the edge. Mesh
+ * fixes that hand-place a few loops of vertices along the eaves (Simplicity of Snow's) put that
+ * right; this class places them at runtime, for any shape, against the roof that is actually
+ * there.
+ *
+ * It is a refinement, not a re-mesh: triangles are split, never moved, and only where a probe
+ * shows the straight line to be wrong. Every edge of a triangle that can hold snow is sampled at
+ * a few points, the openness found there compared with what its two ends interpolate to, and an
+ * edge whose worst sample is off by more than the tolerance is split at that sample. A triangle
+ * whose edges all pass but whose middle does not (a roof corner over the middle of a large
+ * triangle) splits its longest edge. The children go through the same test, round by round,
+ * until every sample agrees or an edge would get shorter than the lattice resolves. Deep under
+ * cover and out in the open everything interpolates flat and nothing is touched: the vertices
+ * land in the fade band and along the drip line, which is where the hand-made fixes put them.
+ *
+ * Splits are decided per geometric edge - by the positions of its ends, not by their indices -
+ * so that the two triangles sharing an edge, and the duplicated vertices of a seam between two
+ * plank strips, split at the same point and stay watertight. Triangles that cannot hold snow (a
+ * plank's side, a wall) are never split, not even to conform with a split neighbor: the seam
+ * they leave is one the hand-made fixes leave too (their floor top is a shape of its own), and
+ * splitting them would double the vertex count for a surface that shows no snow.
+ *
+ * Every added vertex is a convex combination of the model's own vertices, from which its
+ * attributes are interpolated when the vertex buffer is built (ProjectedVertexData); its
+ * position is the model space split point itself, computed in the same order on both sides of
+ * a seam so that the two copies are bit for bit the same.
+ */
+class ShelterRefinement {
+public:
+    ShelterRefinement() = delete;
+
+    /**
+     * @brief A vertex added to a shape: a convex combination of up to three of the model's own
+     */
+    struct Vertex {
+        std::array<std::uint16_t, 3> source {}; /**< Model vertex indices; an unused slot repeats the first */
+        std::array<float, 3> weight {}; /**< Their weights, summing to 1; 0 in an unused slot */
+        RE::NiPoint3 position; /**< Model space position */
+    };
+
+    struct Result {
+        std::vector<Vertex> added; /**< Appended after the model's vertices, in index order */
+        std::vector<std::uint16_t> indices; /**< The whole refined triangle list */
+        std::size_t probes {}; /**< Field lookups spent, for the log */
+    };
+
+    /**
+     * @brief How far the refinement may go
+     */
+    struct Limits {
+        float tolerance {}; /**< Openness the interpolation may be off by before a split is worth a vertex */
+        float minEdge {}; /**< The shortest edge a split may leave behind, in world units */
+        float minHeight {}; /**< The narrowest triangle (its height over its longest edge) worth testing at all:
+                               a sliver - a rope, the side of a plank, the edge of a beam - has no room across
+                               it to show a wedge, however far off its openness runs along it */
+        int maxRounds {}; /**< Rounds of splitting; each round halves an edge at most */
+        std::size_t maxAddedVertices {}; /**< Vertices that may be added to the shape */
+        std::size_t maxTriangles {}; /**< Triangles the refined shape may have in all */
+    };
+
+    constexpr static float K_TOLERANCE = 0.15F; /**< Of the way from bare to snowed. On the steepest part of the
+                                                   fade this moves the snow's edge by a tenth of the fade, less
+                                                   than the lattice locates a drip line to; tighter buys vertices,
+                                                   not accuracy */
+    constexpr static float K_MIN_EDGE = 16.0F; /**< Half a lattice spacing: the field itself resolves nothing finer */
+    constexpr static float K_MIN_HEIGHT = 12.0F; /**< Narrower than a plank, wider than a rope or a beam's edge */
+    constexpr static int K_MAX_ROUNDS = 6; /**< Enough to bring a 512 unit edge down to the minimum */
+    constexpr static std::size_t K_MAX_ADDED_VERTICES = 4096; /**< Per shape, whatever its size */
+
+    /**
+     * @brief Refines a shape's triangle list against a field
+     *
+     * The three per vertex arrays are extended in place with the added vertices, so that the
+     * caller's settling and tallying see the refined mesh as they would any other.
+     *
+     * @param field The 3x3 block of height maps around the shape
+     * @param modelPositions Model space positions of the shape's own vertices
+     * @param positions World space positions of the shape's own vertices; the added ones are appended
+     * @param normals World space normals, one per position, or empty for a mesh without them; appended alike
+     * @param openness Per vertex, from Field::initialOpenness; the added vertices come with theirs
+     * @param indices The shape's triangle list
+     * @param holdsSnowFrom The facing (dot(normal, up)) from which a vertex can hold snow: only
+     *        triangles with such a corner are refined
+     * @param fade The profile's shelterFade
+     * @param limits How far to go
+     * @return std::optional<Result> std::nullopt when nothing was split (the arrays are then unchanged)
+     */
+    [[nodiscard]] static auto refine(const ShelterMap::Field& field,
+                                     std::span<const RE::NiPoint3> modelPositions,
+                                     std::vector<RE::NiPoint3>& positions,
+                                     std::vector<RE::NiPoint3>& normals,
+                                     std::vector<float>& openness,
+                                     std::span<const std::uint16_t> indices,
+                                     float holdsSnowFrom,
+                                     float fade,
+                                     const Limits& limits) -> std::optional<Result>;
+};
+
+} // namespace XPMF

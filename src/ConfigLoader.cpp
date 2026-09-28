@@ -440,6 +440,8 @@ void ConfigLoader::loadConfig()
             profile.neutralizeVertexAlphaSkip = patterns("neutralizeVertexAlphaSkip");
             profile.roofShelter = fields.boolean("roofShelter", DEFAULT_ROOF_SHELTER);
             profile.roofShelterSkip = patterns("roofShelterSkip");
+            profile.roofShelterFixVertices
+                = fields.boolean("roofShelterFixVertices", DEFAULT_ROOF_SHELTER_FIX_VERTICES);
             profile.shelterFade = fields.number("shelterFade", 0.0F, MAX_SHELTER_FADE, DEFAULT_SHELTER_FADE);
             // The mesh's specular on the shapes the projection is on (ProjectedGeometry)
             profile.specularMult = fields.optionalNumberBetween("specularMult", 0.0, MAX_SPECULAR_MULT);
@@ -533,6 +535,8 @@ void ConfigLoader::loadConfig()
                      joinList(profile.neutralizeVertexAlphaSkip));
         spdlog::info("Config Loaded: [{}] Roof Shelter: {}", profile.name, profile.roofShelter);
         spdlog::info("Config Loaded: [{}] Roof Shelter Skip: {}", profile.name, joinList(profile.roofShelterSkip));
+        spdlog::info(
+            "Config Loaded: [{}] Roof Shelter Fix Vertices: {}", profile.name, profile.roofShelterFixVertices);
         spdlog::info("Config Loaded: [{}] Shelter Fade: {}", profile.name, profile.shelterFade);
         spdlog::info("Config Loaded: [{}] Specular Mult: {}",
                      profile.name,
@@ -577,6 +581,7 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     snow.neutralizeVertexColors = DEFAULT_NEUTRALIZE_VERTEX_COLORS;
     snow.neutralizeVertexAlpha = DEFAULT_NEUTRALIZE_VERTEX_ALPHA;
     snow.roofShelter = DEFAULT_ROOF_SHELTER;
+    snow.roofShelterFixVertices = DEFAULT_ROOF_SHELTER_FIX_VERTICES;
     snow.shelterFade = DEFAULT_SHELTER_FADE;
 
     // Ash falls like snow and lies like snow, so it gets everything snow gets - except the snow

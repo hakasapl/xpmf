@@ -49,6 +49,7 @@ set(headers
     "include/ProjectedVertexData.hpp"
     "include/SeasonsOfSkyrim.hpp"
     "include/ShelterMap.hpp"
+    "include/ShelterRefinement.hpp"
     "include/Text.hpp"
     "include/TextureColor.hpp"
     "include/VertexLayout.hpp"
@@ -66,6 +67,7 @@ set(sources
     "src/ProjectedVertexData.cpp"
     "src/SeasonsOfSkyrim.cpp"
     "src/ShelterMap.cpp"
+    "src/ShelterRefinement.cpp"
     "src/TextureColor.cpp"
 )
 

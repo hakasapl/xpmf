@@ -6,6 +6,7 @@
 #include "ProjectedVertexData.hpp"
 #include "SeasonsOfSkyrim.hpp"
 #include "ShelterMap.hpp"
+#include "ShelterRefinement.hpp"
 #include "Text.hpp"
 #include "VertexLayout.hpp"
 
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -205,13 +207,14 @@ void ProjectedGeometry::onMaterialsReady(Materials materials,
     for (const auto& profile : ConfigLoader::getProfiles()) {
         spdlog::info(
             "Geometry pass: profile '{}' has {} material objects (vertex colors: {}, neutralize vertex alpha: {}, "
-            "roof shelter: {})",
+            "roof shelter: {}, roof shelter fix vertices: {})",
             profile.name,
             std::ranges::count_if(s_materials,
                                   [&](const auto& item) -> bool { return item.second.profile == &profile; }),
             profile.neutralizeVertexColors,
             profile.neutralizeVertexAlpha,
-            profile.roofShelter);
+            profile.roofShelter,
+            profile.roofShelter && profile.roofShelterFixVertices);
     }
 }
 
@@ -247,9 +250,11 @@ auto ProjectedGeometry::settingsOf(const Treatment& treatment,
     const auto named = [&](std::unordered_set<const RE::TESForm*> Kept::* list) -> bool {
         return kept != s_kept.end() && base != nullptr && (kept->second.*list).contains(base);
     };
+    const bool shelter = profile.roofShelter && !named(&Kept::shelter);
     return {.neutralizeColors = profile.neutralizeVertexColors && !named(&Kept::colors),
             .neutralizeAlpha = profile.neutralizeVertexAlpha && !named(&Kept::alpha),
-            .shelter = profile.roofShelter && !named(&Kept::shelter),
+            .shelter = shelter,
+            .fixVertices = shelter && profile.roofShelterFixVertices,
             .specularMult = profile.specularMult};
 }
 
@@ -515,7 +520,8 @@ void ProjectedGeometry::dressClone(RE::NiAVObject& root,
                                                       .keepAlpha = shape->keepAlpha,
                                                       .neutralize = settings.neutralizeColors,
                                                       .shelter = settings.shelter,
-                                                      .neutralizeAlpha = settings.neutralizeAlpha};
+                                                      .neutralizeAlpha = settings.neutralizeAlpha,
+                                                      .fixVertices = settings.fixVertices && shape->refinable};
         if (auto* const variant = ProjectedVertexData::shared(description); variant != nullptr) {
             ProjectedVertexData::install(*shape->shape, variant);
         }
@@ -584,7 +590,15 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     // ...with a rigid static's vertex layout
     const auto layout = VertexLayout::from(data->vertexDesc);
     const auto& counts = shape->GetTrishapeRuntimeData();
-    if (!layout.has_value() || counts.vertexCount == 0 || counts.triangleCount == 0) {
+    std::uint32_t vertexCount = counts.vertexCount;
+    std::uint32_t triangleCount = counts.triangleCount;
+    // A shape drawing a refined variant counts that variant's vertices and triangles; what
+    // everything here reads and rebuilds from is the model's, which the registry remembers
+    if (const auto model = ProjectedVertexData::sourceCountsOf(data); model.has_value()) {
+        vertexCount = model->vertices;
+        triangleCount = model->triangles;
+    }
+    if (!layout.has_value() || vertexCount == 0 || triangleCount == 0) {
         return std::nullopt;
     }
     // Alpha that is looked at for transparency is not this plugin's to rewrite - unless all it is
@@ -596,7 +610,7 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     bool keepAlpha = false;
     RE::NiAlphaProperty* alphaTest = nullptr;
     if (auto* const alpha = geometry.alphaProperty.get(); alpha != nullptr) {
-        if (isPlainAlphaTest(*alpha) && !paintsAlpha(*ProjectedVertexData::sourceOf(data), counts.vertexCount)) {
+        if (isPlainAlphaTest(*alpha) && !paintsAlpha(*ProjectedVertexData::sourceOf(data), vertexCount)) {
             alphaTest = alpha;
         } else {
             keepAlpha = true;
@@ -605,10 +619,10 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     return ShapeView {.shape = shape,
                       .shader = shader,
                       .data = data,
-                      .layout = *layout,
-                      .vertexCount = counts.vertexCount,
-                      .triangleCount = counts.triangleCount,
+                      .vertexCount = vertexCount,
+                      .triangleCount = triangleCount,
                       .keepAlpha = keepAlpha,
+                      .refinable = type == RE::BSGeometry::Type::kTriShape,
                       .alphaTest = alphaTest};
 }
 
@@ -785,6 +799,16 @@ void ProjectedGeometry::slice()
         std::erase_if(s_alphaTests, [](const auto& item) -> bool { return item.second.property->GetRefCount() <= 1; });
         std::erase_if(s_switchedOff, [](const auto& item) -> bool { return item.second->GetRefCount() <= 1; });
         s_nextGarbage = now + K_GARBAGE_INTERVAL;
+
+        if (const auto builds = s_refinedBuilds.load(std::memory_order_relaxed); builds != s_loggedRefinedBuilds) {
+            spdlog::info("Roof shelter vertex fix: {} refined vertex buffers built so far, adding {} vertices and {} "
+                         "triangles in all over {} field probes",
+                         builds,
+                         s_refinedVertices.load(std::memory_order_relaxed),
+                         s_refinedTriangles.load(std::memory_order_relaxed),
+                         s_refinedProbes.load(std::memory_order_relaxed));
+            s_loggedRefinedBuilds = builds;
+        }
     }
 
     s_lastSliceEnd.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
@@ -1149,13 +1173,18 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
             return;
         }
 
-        if (shelter && shape->data->rawIndexData != nullptr) {
-            ProjectedVertexData::addRef(shape->data);
+        // The model's own data is what is rasterized: the same surface as any variant of it, with
+        // the counts the view reports (a refined variant has more of both) and with the model's
+        // own layout (a variant may carry a color the model has not, and a stride to match)
+        Data* const source = ProjectedVertexData::sourceOf(shape->data);
+        const auto sourceLayout = VertexLayout::from(source->vertexDesc);
+        if (shelter && sourceLayout.has_value() && source->rawIndexData != nullptr) {
+            ProjectedVertexData::addRef(source);
             gather.occluders.push_back({.keepAlive = RE::NiPointer<RE::BSTriShape> {shape->shape},
-                                        .pinned = shape->data,
+                                        .pinned = source,
                                         .vertexCount = shape->vertexCount,
                                         .triangleCount = shape->triangleCount,
-                                        .layout = shape->layout,
+                                        .layout = *sourceLayout,
                                         .world = shape->shape->world});
         }
 
@@ -1187,7 +1216,6 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         const float cosAngle = projection.alpha;
         const float threshold = ((1.0F - cosAngle) * projection.green) + cosAngle;
         const float noiseAmplitude = (1.0F - cosAngle) * projection.red;
-        Data* const source = ProjectedVertexData::sourceOf(shape->data);
         ProjectedVertexData::addRef(source);
         gather.receivers.push_back(
             {.keepAlive = RE::NiPointer<RE::BSTriShape> {shape->shape},
@@ -1198,7 +1226,8 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
                        .keepAlpha = shape->keepAlpha,
                        .neutralize = settings.neutralizeColors,
                        .shelter = settings.shelter,
-                       .neutralizeAlpha = settings.neutralizeAlpha},
+                       .neutralizeAlpha = settings.neutralizeAlpha,
+                       .fixVertices = settings.fixVertices && shape->refinable},
              .current = shape->data,
              .projected = shape->shader->flags.any(ShaderFlag::kProjectedUV),
              .currentFingerprint = ProjectedVertexData::fingerprintOf(shape->data),
@@ -1461,13 +1490,9 @@ auto ProjectedGeometry::run(RasterJob& job) -> RasterResult
     return result;
 }
 
-auto ProjectedGeometry::measureOpenness(const Receiver& receiver,
-                                        const ShelterMap::Field& field,
-                                        const VertexLayout& layout,
-                                        std::span<const RE::NiPoint3> normals,
-                                        float edgeOpenness,
-                                        std::vector<RE::NiPoint3>& positions,
-                                        std::vector<float>& openness) -> bool
+void ProjectedGeometry::worldPositions(const Receiver& receiver,
+                                       const VertexLayout& layout,
+                                       std::vector<RE::NiPoint3>& positions)
 {
     const Data& source = *receiver.shape.source;
     const std::uint32_t vertexCount = receiver.shape.vertexCount;
@@ -1478,13 +1503,21 @@ auto ProjectedGeometry::measureOpenness(const Receiver& receiver,
         positions[index] = receiver.world
             * VertexLayout::position(vertices.subspan(static_cast<std::size_t>(index) * layout.stride, layout.stride));
     }
+}
 
-    // A shape without a CPU index list still gets per vertex values, just no edge placement
-    std::span<const std::uint16_t> indices;
-    if (source.rawIndexData != nullptr) {
-        indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
-    }
-    return field.measureOpenness(positions, normals, indices, receiver.fade, edgeOpenness, openness);
+auto ProjectedGeometry::refinementLimits(std::uint32_t vertexCount) -> ShelterRefinement::Limits
+{
+    constexpr std::size_t MAX_COUNT = std::numeric_limits<std::uint16_t>::max(); /**< What a BSTriShape counts to */
+    constexpr std::size_t MIN_ALLOWANCE = 128; /**< Even a plank of four vertices may need a few loops */
+    const std::size_t room = MAX_COUNT - std::min<std::size_t>(vertexCount, MAX_COUNT);
+    return {.tolerance = ShelterRefinement::K_TOLERANCE,
+            .minEdge = ShelterRefinement::K_MIN_EDGE,
+            .minHeight = ShelterRefinement::K_MIN_HEIGHT,
+            .maxRounds = ShelterRefinement::K_MAX_ROUNDS,
+            .maxAddedVertices = std::min({ShelterRefinement::K_MAX_ADDED_VERTICES,
+                                          std::max<std::size_t>(vertexCount, MIN_ALLOWANCE),
+                                          room}),
+            .maxTriangles = MAX_COUNT};
 }
 
 auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
@@ -1497,6 +1530,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
     result.epoch = job.epoch;
 
     std::vector<RE::NiPoint3> positions;
+    std::vector<RE::NiPoint3> modelPositions;
     std::vector<RE::NiPoint3> normals;
     std::vector<float> openness;
     std::vector<float> facing;
@@ -1548,17 +1582,73 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                          EDGE_MARGIN,
                          1.0F - EDGE_MARGIN);
 
-        facing.resize(vertexCount);
-        for (std::uint32_t index = 0; index < vertexCount; ++index) {
-            facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
-        }
-
         // A vertex holds snow if it could show any with nothing overhead
         const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
+
+        // A shape without a CPU index list still gets per vertex values, just no edge placement
+        // and no refinement
+        std::span<const std::uint16_t> indices;
+        if (source.rawIndexData != nullptr) {
+            indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
+        }
+
         auto verdict = ShelterMap::Verdict::OPEN;
-        if (shelter && measureOpenness(receiver, job.field, *layout, normals, edgeOpenness, positions, openness)) {
-            verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
-                                        !receiver.shape.keepAlpha);
+        std::optional<ShelterRefinement::Result> refinement;
+        if (shelter) {
+            worldPositions(receiver, *layout, positions);
+            bool anyCover = job.field.initialOpenness(positions, normals, receiver.fade, openness);
+
+            // The vertex fix, where the profile wants it and the shape can take it: with a vertex
+            // under cover there is a fade to follow; without one there may still be a roof edge
+            // crossing the middle of a triangle, which is worth a look only if any column over
+            // the shape's footprint tops out above it at all
+            if (receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
+                bool worthALook = anyCover;
+                if (!worthALook) {
+                    RE::NiPoint3 low = positions.front();
+                    RE::NiPoint3 high = positions.front();
+                    for (const auto& position : positions) {
+                        low.x = std::min(low.x, position.x);
+                        low.y = std::min(low.y, position.y);
+                        low.z = std::min(low.z, position.z);
+                        high.x = std::max(high.x, position.x);
+                        high.y = std::max(high.y, position.y);
+                        high.z = std::max(high.z, position.z);
+                    }
+                    worthALook = job.field.overhead(low.x, low.y, high.x, high.y, low.z, high.z).anyCovered;
+                }
+                if (worthALook) {
+                    modelPositions.resize(vertexCount);
+                    for (std::uint32_t index = 0; index < vertexCount; ++index) {
+                        modelPositions[index] = VertexLayout::position(vertexAt(index));
+                    }
+                    refinement = ShelterRefinement::refine(job.field,
+                                                           modelPositions,
+                                                           positions,
+                                                           normals,
+                                                           openness,
+                                                           indices,
+                                                           holdsSnowFrom,
+                                                           receiver.fade,
+                                                           refinementLimits(vertexCount));
+                    if (refinement.has_value()) {
+                        indices = refinement->indices;
+                        anyCover = anyCover
+                            || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
+                        s_refinedProbes.fetch_add(refinement->probes, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            if (anyCover) {
+                job.field.settleOpenness(positions, indices, receiver.fade, edgeOpenness, openness);
+                facing.resize(positions.size());
+                for (std::size_t index = 0; index < positions.size(); ++index) {
+                    facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
+                }
+                verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
+                                            !receiver.shape.keepAlpha);
+            }
         }
 
         Data* wanted = nullptr;
@@ -1573,8 +1663,10 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             ProjectedVertexData::addRef(receiver.shape.source);
             wanted = receiver.shape.source;
         } else {
-            values.resize(vertexCount);
-            for (std::uint32_t index = 0; index < vertexCount; ++index) {
+            // One value per vertex of the shape as it will be drawn: the model's, then the added
+            const std::size_t total = openness.size();
+            values.resize(total);
+            for (std::size_t index = 0; index < total; ++index) {
                 const float gone = goneAlpha(facing[index]);
                 values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
             }
@@ -1582,11 +1674,28 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                 // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
                 alphaThreshold = scaledAlphaThreshold(receiver.alphaThreshold, *std::ranges::min_element(values));
             }
-            if (receiver.projected && ProjectedVertexData::fingerprint(values) == receiver.currentFingerprint
+            const std::uint64_t fingerprint = refinement.has_value()
+                ? ProjectedVertexData::fingerprintRefined(values, *refinement)
+                : ProjectedVertexData::fingerprint(values);
+            if (receiver.projected && fingerprint == receiver.currentFingerprint
                 && alphaThreshold == receiver.currentAlphaThreshold) {
                 continue; // what it already has
             }
-            wanted = ProjectedVertexData::custom(receiver.shape, values);
+            if (refinement.has_value()) {
+                wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values);
+                if (wanted != nullptr) {
+                    s_refinedBuilds.fetch_add(1, std::memory_order_relaxed);
+                    s_refinedVertices.fetch_add(refinement->added.size(), std::memory_order_relaxed);
+                    s_refinedTriangles.fetch_add((refinement->indices.size() / 3) - receiver.shape.triangleCount,
+                                                 std::memory_order_relaxed);
+                } else {
+                    // The refined buffer could not be had (the budget, or a failed creation): the
+                    // mask on the model's own vertices is still the better part of the fix
+                    wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
+                }
+            } else {
+                wanted = ProjectedVertexData::custom(receiver.shape, values);
+            }
             if (wanted == nullptr) {
                 wanted = ProjectedVertexData::shared(receiver.shape); // over budget
                 alphaThreshold = receiver.alphaThreshold;
