@@ -435,7 +435,8 @@ private:
         bool keepAlpha {}; /**< See ProjectedVertexData::Shape::keepAlpha */
         bool refinable {}; /**< A plain tri shape, whose triangle list may be traded for a longer one: not a mesh
                               LOD tri shape, which draws a prefix of its list per level */
-        RE::NiAlphaProperty* alphaTest {}; /**< The shape's alpha property when its alpha is tested against a
+        RE::NiAlphaProperty* alphaTest {}; /**< The shape's alpha property - the model's, or the shape's own copy of
+                                              it (setAlphaThreshold) - when its alpha is tested against a
                                               threshold and nothing else, and the mesh paints none: such a shape
                                               is masked like any other, with the threshold scaled to match (see
                                               scaledAlphaThreshold); nullptr otherwise */
@@ -458,15 +459,35 @@ private:
                                           std::uint32_t vertexCount) -> bool;
 
     /**
-     * @brief The threshold an alpha property had before this plugin scaled it, if it did
+     * @brief The mesh's threshold of a shape's alpha property: the one it holds, unless it is the
+     * shape's own copy holding a scaled one
      */
     [[nodiscard]] static auto originalAlphaThreshold(const RE::NiAlphaProperty& alpha) -> std::uint8_t;
 
     /**
-     * @brief Sets an alpha property's threshold, remembering the original the first time; main thread
+     * @brief Gives a shape's alpha test the threshold that goes with its vertex alpha; main thread
+     *
+     * The alpha property a shape is loaded with is not its own. The engine's clone of a model
+     * hands every instance the model's one object (NiAlphaProperty::CreateClone answers with the
+     * property itself unless it is animated or flagged for copying), and shapes of one model that
+     * name the same property share it besides - a covered walkway's roof and its floor. A
+     * threshold written there is everyone's: the floor's scaled one lasts until the roof, out in
+     * the open, asks for the mesh's back, and the floor's lowered alpha then cuts the floor away.
+     * So a threshold other than the mesh's goes into a copy that the shape gets for itself, and
+     * the mesh's own puts the model's property back on the shape.
+     *
+     * @return bool false when the shape needs a threshold of its own and no copy could be made:
+     *         its alpha must then not be lowered
      */
-    static void setAlphaThreshold(RE::NiAlphaProperty& alpha,
-                                  std::uint8_t threshold);
+    [[nodiscard]] static auto setAlphaThreshold(RE::BSTriShape& shape,
+                                                std::uint8_t threshold) -> bool;
+
+    /**
+     * @brief A copy of an alpha property, which the engine's clone does not make by itself
+     *
+     * @return RE::NiPointer<RE::NiAlphaProperty> nullptr if the engine made none
+     */
+    [[nodiscard]] static auto copyOf(RE::NiAlphaProperty& model) -> RE::NiPointer<RE::NiAlphaProperty>;
 
     /**
      * @brief The alpha test threshold that keeps a shape's pixels exactly where they were once its
@@ -494,7 +515,8 @@ private:
      * Projected_UV follows `projected`, and Snow with it where the material had asked for it (ash
      * has not: on its own the flag would switch the improved snow shading on); Vertex_Colors is
      * switched on for a variant built for a shape that did not show its colors, and off again when
-     * such a shape gets the model's data back.
+     * such a shape gets the model's data back. An alpha tested shape is given its threshold first
+     * (setAlphaThreshold); where that fails nothing is swapped.
      */
     static void apply(const Swap& swap);
 
@@ -558,14 +580,16 @@ private:
     static inline CellSink s_cellSink;
 
     /**
-     * @brief An alpha property whose threshold this plugin has scaled
+     * @brief A shape's own copy of its model's alpha property, holding a threshold this plugin scaled
      */
     struct ScaledAlphaTest {
-        RE::NiPointer<RE::NiAlphaProperty> property; /**< Pinned, so that its address stays its own */
+        RE::NiPointer<RE::NiAlphaProperty> property; /**< The copy; pinned, so that its address stays its own */
+        RE::NiPointer<RE::NiAlphaProperty> model; /**< What the shape was loaded with, and gets back along with
+                                                     the mesh's threshold */
         std::uint8_t original {}; /**< The mesh's threshold */
     };
 
-    // Main thread only
+    // Main thread only; by the copy
     static inline std::unordered_map<const RE::NiAlphaProperty*, ScaledAlphaTest> s_alphaTests;
     /**
      * @brief The shapes whose projection this plugin switched off (apply), pinned so that their
