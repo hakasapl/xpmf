@@ -646,19 +646,80 @@ auto ProjectedGeometry::originalAlphaThreshold(const RE::NiAlphaProperty& alpha)
     return found != s_alphaTests.end() ? found->second.original : alpha.alphaThreshold;
 }
 
-void ProjectedGeometry::setAlphaThreshold(RE::NiAlphaProperty& alpha,
-                                          std::uint8_t threshold)
+auto ProjectedGeometry::setAlphaThreshold(RE::BSTriShape& shape,
+                                          std::uint8_t threshold) -> bool
 {
-    if (const auto found = s_alphaTests.find(&alpha); found != s_alphaTests.end()) {
-        if (threshold == found->second.original) {
-            s_alphaTests.erase(found); // back to the mesh's: nothing left to remember
-        }
-    } else if (threshold != alpha.alphaThreshold) {
-        s_alphaTests.emplace(&alpha,
-                             ScaledAlphaTest {.property = RE::NiPointer<RE::NiAlphaProperty> {&alpha},
-                                              .original = alpha.alphaThreshold});
+    auto& geometry = shape.GetGeometryRuntimeData();
+    auto* const alpha = geometry.alphaProperty.get();
+    if (alpha == nullptr) {
+        return true; // nothing tests the shape's alpha any more
     }
-    alpha.alphaThreshold = threshold; // read at every draw; nothing to set up again
+
+    // The shape's own copy takes any threshold. Asked for the mesh's it has done its work: the
+    // model's property goes back on, and the copy goes with the last reference to it
+    if (const auto found = s_alphaTests.find(alpha); found != s_alphaTests.end()) {
+        if (threshold == found->second.original) {
+            geometry.alphaProperty = found->second.model;
+            s_alphaTests.erase(found);
+        } else {
+            alpha->alphaThreshold = threshold; // read at every draw; nothing to set up again
+        }
+        return true;
+    }
+    if (threshold == alpha->alphaThreshold) {
+        return true; // the model's property at the mesh's threshold: as loaded
+    }
+
+    // The model's property is every instance's, and every shape's of the model that names the
+    // same one: this shape's threshold needs a property of its own
+    auto copy = copyOf(*alpha);
+    auto* const own = copy.get();
+    if (own == nullptr) {
+        static std::atomic<bool> loggedRefusal {false};
+        if (!loggedRefusal.exchange(true)) {
+            spdlog::warn("The engine made no copy of an alpha property; alpha tested shapes keep their projection "
+                         "under cover rather than be cut away by a lowered alpha");
+        }
+        return false;
+    }
+    const std::uint8_t original = alpha->alphaThreshold;
+    own->alphaThreshold = threshold;
+    ScaledAlphaTest scaled {
+        .property = std::move(copy), .model = RE::NiPointer<RE::NiAlphaProperty> {alpha}, .original = original};
+    geometry.alphaProperty = scaled.property;
+    s_alphaTests.emplace(own, std::move(scaled));
+
+    static std::atomic<bool> loggedCopy {false};
+    if (!loggedCopy.exchange(true)) {
+        spdlog::info("Alpha tested shapes partly under cover get an alpha property of their own for their scaled "
+                     "test threshold, the model's being shared by all of its instances; the first was just made "
+                     "(threshold {} -> {})",
+                     static_cast<std::uint32_t>(original),
+                     static_cast<std::uint32_t>(threshold));
+    }
+    return true;
+}
+
+auto ProjectedGeometry::copyOf(RE::NiAlphaProperty& model) -> RE::NiPointer<RE::NiAlphaProperty>
+{
+    // NiAlphaProperty::CreateClone answers with the property itself - which is how every clone of
+    // a model comes to share one - unless the property is animated or one of the top two bits of
+    // its flags is set. With the bit set for the length of the call the engine does the copying;
+    // neither the model's property nor the copy keeps it.
+    constexpr auto COPY_WHEN_CLONED = static_cast<std::uint16_t>(RE::NiAlphaProperty::AlphaFlags::kIsEditorModifiable);
+    const std::uint16_t flags = model.alphaFlags;
+    model.alphaFlags = static_cast<std::uint16_t>(flags | COPY_WHEN_CLONED);
+    const RE::NiPointer<RE::NiObject> clone {model.Clone()};
+    model.alphaFlags = flags;
+    if (clone == nullptr || clone.get() == &model) {
+        return nullptr;
+    }
+    auto* const copy = netimmerse_cast<RE::NiAlphaProperty*>(clone.get());
+    if (copy == nullptr) {
+        return nullptr;
+    }
+    copy->alphaFlags = flags;
+    return RE::NiPointer<RE::NiAlphaProperty> {copy};
 }
 
 auto ProjectedGeometry::scaledAlphaThreshold(std::uint8_t original,
@@ -674,6 +735,14 @@ void ProjectedGeometry::apply(const Swap& swap)
     RE::BSTriShape& shape = *swap.shape;
     Data* const data = swap.data;
     const bool projected = swap.projected;
+
+    // An alpha tested shape's threshold goes with the vertex alpha it is about to get, and ahead
+    // of it: the alpha alone would cut the shape away. A shape that cannot have its threshold
+    // keeps what it has, vertex data and all
+    if (swap.alphaThreshold.has_value() && !setAlphaThreshold(shape, *swap.alphaThreshold)) {
+        ProjectedVertexData::release(data);
+        return;
+    }
 
     const bool hadColorlessVariant
         = ProjectedVertexData::isForColorlessShape(shape.GetGeometryRuntimeData().rendererData);
@@ -714,9 +783,6 @@ void ProjectedGeometry::apply(const Swap& swap)
     }
     if (changed) {
         shader->SetupGeometry(&shape); // as the engine does after changing the projected UV flags
-    }
-    if (auto* const alpha = geometry.alphaProperty.get(); swap.alphaThreshold.has_value() && alpha != nullptr) {
-        setAlphaThreshold(*alpha, *swap.alphaThreshold);
     }
 }
 
@@ -780,7 +846,7 @@ void ProjectedGeometry::slice()
 
     if (now >= s_nextGarbage) {
         ProjectedVertexData::collectGarbage();
-        // An alpha property only this registry still holds belongs to a shape that is gone, and a
+        // A copied alpha property only this registry still holds was a shape's that is gone, and a
         // shape only the switched-off list still holds is gone itself
         std::erase_if(s_alphaTests, [](const auto& item) -> bool { return item.second.property->GetRefCount() <= 1; });
         std::erase_if(s_switchedOff, [](const auto& item) -> bool { return item.second->GetRefCount() <= 1; });
