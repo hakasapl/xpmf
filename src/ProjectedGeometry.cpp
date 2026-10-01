@@ -1599,6 +1599,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
     std::vector<RE::NiPoint3> modelPositions;
     std::vector<RE::NiPoint3> normals;
     std::vector<float> openness;
+    std::vector<bool> measured; // per vertex, whether the vertex fix has its openness in hand
     std::vector<float> facing;
     std::vector<std::uint8_t> values; // per vertex, what the mesh's alpha is scaled by, or becomes
     for (auto& receiver : job.receivers) {
@@ -1668,6 +1669,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             // under cover there is a fade to follow; without one there may still be a roof edge
             // crossing the middle of a triangle, which is worth a look only if any column over
             // the shape's footprint tops out above it at all
+            measured.clear();
             if (receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
                 bool worthALook = anyCover;
                 if (!worthALook) {
@@ -1693,6 +1695,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                                                            positions,
                                                            normals,
                                                            openness,
+                                                           measured,
                                                            indices,
                                                            holdsSnowFrom,
                                                            receiver.fade,
@@ -1707,7 +1710,11 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             }
 
             if (anyCover) {
-                job.field.settleOpenness(positions, indices, receiver.fade, edgeOpenness, openness);
+                // What the vertex fix tested stands as measured: left to the settling, a floor's
+                // rim would be pulled down to mend the middle of triangles that are no longer
+                // there, and a hard edge left along it. The settling is for the rest - what was
+                // too narrow or too small to test, and every shape the fix is not for
+                job.field.settleOpenness(positions, indices, receiver.fade, edgeOpenness, measured, openness);
                 facing.resize(positions.size());
                 for (std::size_t index = 0; index < positions.size(); ++index) {
                     facing[index] = layout->hasNormals ? normals[index].z : 1.0F;

@@ -344,6 +344,7 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
                                        std::span<const std::uint16_t> indices,
                                        float fade,
                                        float edgeOpenness,
+                                       const std::vector<bool>& measured,
                                        std::vector<float>& openness) const
 {
     if (indices.empty() || openness.size() != positions.size()) {
@@ -358,6 +359,10 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
     for (std::size_t index = 0; index < positions.size(); ++index) {
         isOpen[index] = openness[index] >= 1.0F;
     }
+    // ...and which stand as they are: the ones ShelterRefinement measured. Every step below reads
+    // them and none writes them
+    const auto stands = [&](std::size_t vertex) -> bool { return vertex < measured.size() && measured[vertex]; };
+    const auto movable = [&](std::size_t vertex) -> bool { return !isOpen[vertex] && !stands(vertex); };
     const auto isTriangle = [&](const std::array<std::size_t, 3>& triangle) -> bool {
         return triangle[0] < positions.size() && triangle[1] < positions.size() && triangle[2] < positions.size();
     };
@@ -366,13 +371,14 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
     // interpolate to more openness than a probe in the middle has, the covered corners are lowered
     // just enough to close the gap, the excess spread over them in proportion to their weight at
     // the probe; a corner ends at the lowest value any probe asks of it. Open corners are never
-    // touched: a triangle that is mostly in the open keeps its snow there.
+    // touched: a triangle that is mostly in the open keeps its snow there. Neither are measured
+    // ones, and a triangle with no other kind is not looked at.
     constexpr std::array<std::array<float, 3>, 4> PROBES {
         {{1.0F / 3.0F, 1.0F / 3.0F, 1.0F / 3.0F}, {0.5F, 0.5F, 0.0F}, {0.0F, 0.5F, 0.5F}, {0.5F, 0.0F, 0.5F}}};
     std::vector<float> lowered(openness);
     for (std::size_t corner = 0; corner + 2 < indices.size(); corner += 3) {
         const std::array<std::size_t, 3> triangle {indices[corner], indices[corner + 1], indices[corner + 2]};
-        if (!isTriangle(triangle) || (isOpen[triangle[0]] && isOpen[triangle[1]] && isOpen[triangle[2]])) {
+        if (!isTriangle(triangle) || std::ranges::none_of(triangle, movable)) {
             continue;
         }
         const RE::NiPoint3& first = positions[triangle[0]];
@@ -385,7 +391,7 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
             for (std::size_t k = 0; k < triangle.size(); ++k) {
                 const std::size_t vertex = triangle.at(k);
                 interpolated += weights.at(k) * openness[vertex];
-                coveredWeight += isOpen[vertex] ? 0.0F : weights.at(k);
+                coveredWeight += movable(vertex) ? weights.at(k) : 0.0F;
             }
             if (interpolated <= 0.0F || coveredWeight <= 0.0F) {
                 continue; // nothing left to lower, or nothing here that may be
@@ -397,7 +403,7 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
             }
             const float cut = excess / coveredWeight;
             for (const std::size_t vertex : triangle) {
-                if (!isOpen[vertex]) {
+                if (movable(vertex)) {
                     lowered[vertex] = std::min(lowered[vertex], std::max(openness[vertex] - cut, 0.0F));
                 }
             }
@@ -441,7 +447,9 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
         constexpr float MIN_TARGET = 0.05F;
         const float target = std::clamp(inTheOpen(open, covered, slope) + (0.5F * fade / length), MIN_TARGET, 1.0F);
         const float needed = 1.0F - ((1.0F - edgeOpenness) / target);
-        openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));
+        if (!stands(covered)) {
+            openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));
+        }
         if (needed < 0.0F) {
             overruns.push_back({.open = open, .covered = covered, .target = target});
         }
@@ -455,7 +463,8 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
         const Slope slope = Slope::ofTriangle(positions[triangle[0]], positions[triangle[1]], positions[triangle[2]]);
         for (const std::size_t covered : triangle) {
             for (const std::size_t open : triangle) {
-                if (!isOpen[covered] && isOpen[open]) {
+                // ...unless both ends are measured: there is nothing on that edge to move
+                if (!isOpen[covered] && isOpen[open] && !(stands(covered) && stands(open))) {
                     localize(covered, open, slope);
                 }
             }
@@ -477,7 +486,7 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
     std::vector<float> wanted(positions.size(), 1.0F); // the lowest value any overrun asks of an open vertex
     for (const auto& overrun : overruns) {
         const float coveredEnd = openness[overrun.covered];
-        if (coveredEnd >= edgeOpenness) {
+        if (coveredEnd >= edgeOpenness || stands(overrun.open)) {
             continue;
         }
         const float value = (edgeOpenness - (coveredEnd * overrun.target)) / (1.0F - overrun.target);

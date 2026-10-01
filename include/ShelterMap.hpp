@@ -128,8 +128,9 @@ public:
          * open; and a triangle whose corners all sit a hand's width under an eave, but whose
          * middle lies deep under the roof, would keep its snow throughout, because nothing ever
          * looks at the middle. Two things put that right: ShelterRefinement, where the profile
-         * allows it, adds the vertices such a mesh lacks; settleOpenness makes the best of the
-         * vertices there are.
+         * allows it, adds the vertices such a mesh lacks, and the openness of this step then
+         * stands as it is on every surface it tested; settleOpenness makes the best of the
+         * vertices there are everywhere else.
          *
          * @param positions World space vertex positions
          * @param normals World space vertex normals, one per position, or empty for a mesh
@@ -173,17 +174,27 @@ public:
          * clear of the roof - is anchored in the open and keeps its snow. Edges running along an
          * eave do not anchor: their whole length is close to cover.
          *
-         * On a refined mesh the vertices already sit where the fade bends, and these steps have
-         * little left to do.
+         * All three trade a vertex's own openness for a better line across the triangles around
+         * it, which is the right trade only where those triangles are all there is to carry the
+         * fade. Where ShelterRefinement has been, they are not: the vertices it tested and the
+         * ones it added sit where the fade bends, each with the openness of its own spot, and two
+         * shapes that meet - one piece of a walkway and the next - agree along the seam because
+         * both read the same field. Those vertices are measured, and no step moves them; what is
+         * left to settle on such a shape is what was too narrow or too small to test, and the
+         * vertices whose normals are bent away from the faces around them: read along a tilt
+         * those faces do not have, their own openness is no measurement of what the faces show.
          *
          * @param indices The mesh's triangle list; empty does nothing
          * @param edgeOpenness Openness at which snow visibly ends on the mesh's material
+         * @param measured Per vertex, whether its openness is to stand as it is (from
+         *        ShelterRefinement::refine); empty for a mesh none of whose vertices are
          * @param openness In: one value per position; out: settled
          */
         void settleOpenness(std::span<const RE::NiPoint3> positions,
                             std::span<const std::uint16_t> indices,
                             float fade,
                             float edgeOpenness,
+                            const std::vector<bool>& measured,
                             std::vector<float>& openness) const;
 
         /**
