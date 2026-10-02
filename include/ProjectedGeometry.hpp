@@ -67,7 +67,8 @@ namespace XPMF {
  *    waits, longer slices, the worker at normal priority - the point being that what is under a
  *    roof is bare by the time the screen fades in, not a second after.
  *  - A below-normal-priority worker rasterizes the occluders into height layers (one per cell
- *    they reach, see ShelterMap) and, once the 3x3 cells around a receiver's cell are quiet,
+ *    they reach, see ShelterMap; each is kept whether the cell it lies over is loaded or not,
+ *    see Cover) and, once the 3x3 cells around a receiver's cell are quiet,
  *    judges each receiver by the vertices that can hold snow (ShelterMap::judge). A cell's first
  *    judgement waits for its own roofs only, its neighbors' coming in over the next seconds and a
  *    second pass following them; every later one waits for the whole neighborhood. In the open ->
@@ -288,6 +289,10 @@ private:
 
     /**
      * @brief Everything known about one loaded exterior cell; main thread only
+     *
+     * Kept by the cell's coordinates, which are not the cell: a city's worldspace and the land
+     * around it number their cells alike, so the form is kept too, and a key whose cell has
+     * become another one starts over (scanGrid).
      */
     struct Cell {
         int cellX {};
@@ -298,17 +303,35 @@ private:
         Clock::time_point lastDirtyAt;
         std::optional<Clock::time_point> recheckAt; /**< The one unconditional re-gather */
         int unreadyRetries {};
-        std::uint64_t epoch {}; /**< Bumped by every gather; older results are dropped */
+        std::uint64_t born {}; /**< s_epoch when the cell was first seen: a result of an epoch no later than
+                                  that is of whatever stood under its key before */
+        std::uint64_t epoch {}; /**< Of its last gather, 0 before the first; no two gathers of any cell share
+                                   one, and results of another are dropped */
         bool rasterInFlight {};
         bool receiversInFlight {};
         bool everJudged {}; /**< Whether its receivers were ever computed; the first time does not wait for the
                                neighbors' roofs, see scheduleReceivers */
         std::vector<Receiver> receivers; /**< From the latest gather, unless in flight */
         Clock::time_point receiversSince; /**< When they were gathered, for K_RECEIVER_TIMEOUT */
+        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against */
+    };
+
+    /**
+     * @brief What stands over one cell's ground: the height layers the loaded cells around it put
+     * there; main thread only
+     *
+     * Kept apart from Cell, because a cell need not be loaded to have a roof put over it. A
+     * building is gathered with the cell its reference is in and stands wherever its model puts
+     * it - across a border, or a whole cell away: Windhelm's Gray Quarter is placed at the edge
+     * of one cell and built in the next. That next cell may load long after the building did, may
+     * lie past the edge of the loaded grid, or may not exist in a walled city's worldspace at
+     * all, and what the building puts over it holds all the same, for as long as the building's
+     * own cell is loaded.
+     */
+    struct Cover {
         std::unordered_map<CellKey, std::shared_ptr<const ShelterMap::Heights>> layers; /**< By source cell */
         std::shared_ptr<const ShelterMap::Heights> map; /**< Maximum over the layers */
-        std::uint64_t mapVersion {}; /**< Bumped whenever map changes */
-        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against */
+        std::uint64_t version {}; /**< Of map; never 0, and no two maps of any cover ever share one */
     };
 
     /**
@@ -536,7 +559,14 @@ private:
     static void finishGather(Clock::time_point now);
     static void scheduleReceivers(Clock::time_point now);
     static void dropCell(CellKey key);
-    static void rebuildMap(Cell& cell);
+
+    /**
+     * @brief Takes what a source cell put over a target cell away again, and the cover with it once
+     * nothing is left over that cell
+     */
+    static void removeLayer(CellKey target,
+                            CellKey source);
+    static void rebuildMap(Cover& cover);
     [[nodiscard]] static auto fieldStamp(const Cell& cell) -> std::uint64_t;
     [[nodiscard]] static auto neighborhoodBusy(const Cell& cell) -> bool;
     static void retire(std::vector<Occluder>& occluders);
@@ -602,6 +632,9 @@ private:
      */
     static inline std::unordered_map<const RE::BSTriShape*, RE::NiPointer<RE::BSTriShape>> s_switchedOff;
     static inline std::unordered_map<CellKey, Cell> s_cells;
+    static inline std::uint64_t s_epoch = 0; /**< The last Cell::epoch given out */
+    static inline std::unordered_map<CellKey, Cover> s_covers; /**< By the cell covered, loaded or not */
+    static inline std::uint64_t s_coverVersion = 0; /**< The last Cover::version given out */
     static inline std::optional<Gather> s_gather;
     static inline std::vector<Occluder> s_retiredOccluders;
     static inline std::vector<Receiver> s_retiredReceivers;

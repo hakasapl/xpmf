@@ -904,27 +904,39 @@ void ProjectedGeometry::drainResults()
     for (auto& result : results) {
         if (auto* const raster = std::get_if<RasterResult>(&result); raster != nullptr) {
             retire(raster->retired);
+            // A cell is not gathered again while its raster is out, so a result that is not of the
+            // cell's own last gather is one of a cell that has gone since - whatever stands under
+            // its key by now
             const auto source = s_cells.find(raster->source);
-            if (source == s_cells.end()) {
+            if (source == s_cells.end() || raster->epoch != source->second.epoch) {
                 continue;
             }
             source->second.rasterInFlight = false;
-            if (raster->epoch != source->second.epoch) {
-                continue; // gathered again since; that job's layers are the ones to keep
-            }
+            // Over every cell of the block, loaded or not: the building whose reference is in this
+            // cell may stand in the next, and that one may load later or never (Cover)
             for (int slotY = 0; slotY < ShelterMap::K_BLOCK; ++slotY) {
                 for (int slotX = 0; slotX < ShelterMap::K_BLOCK; ++slotX) {
-                    const auto target = s_cells.find(keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1));
-                    if (target == s_cells.end()) {
+                    const CellKey target = keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1);
+                    auto& layer = raster->layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
+                    if (layer == nullptr) {
+                        removeLayer(target, raster->source);
                         continue;
                     }
-                    auto& layer = raster->layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
-                    if (layer != nullptr) {
-                        target->second.layers[raster->source] = std::move(layer);
-                    } else if (target->second.layers.erase(raster->source) == 0) {
-                        continue; // had nothing there before either
+                    if (!s_cells.contains(target)) {
+                        static std::atomic<bool> loggedBeyond {false};
+                        if (!loggedBeyond.exchange(true)) {
+                            spdlog::info("The statics of cell {}, {} stand over cell {}, {}, which is not loaded; what "
+                                         "they put over it is kept for when it is, and for their own shapes there. "
+                                         "This was the first such cell",
+                                         raster->cellX,
+                                         raster->cellY,
+                                         raster->cellX + slotX - 1,
+                                         raster->cellY + slotY - 1);
+                        }
                     }
-                    rebuildMap(target->second);
+                    Cover& cover = s_covers[target];
+                    cover.layers[raster->source] = std::move(layer);
+                    rebuildMap(cover);
                 }
             }
             continue;
@@ -935,8 +947,8 @@ void ProjectedGeometry::drainResults()
             s_swaps.push_back(std::move(swap));
         }
         const auto cell = s_cells.find(computed.cell);
-        if (cell == s_cells.end()) {
-            retire(computed.receivers);
+        if (cell == s_cells.end() || computed.epoch <= cell->second.born) {
+            retire(computed.receivers); // its cell has gone since, whatever stands under its key by now
             continue;
         }
         cell->second.receiversInFlight = false;
@@ -1001,11 +1013,29 @@ void ProjectedGeometry::scanGrid(Clock::time_point now)
                 }
                 const CellKey key = keyOf(coordinates->cellX, coordinates->cellY);
                 loaded.insert(key);
+                // A city's worldspace shares its coordinates with the land around it: through the
+                // gate, the grid may hold another cell under a key before a scan ever saw the key
+                // gone. What was known under it was the other cell's
+                if (const auto known = s_cells.find(key);
+                    known != s_cells.end() && known->second.formId != cell->GetFormID()) {
+                    static std::atomic<bool> loggedTakeover {false};
+                    if (!loggedTakeover.exchange(true)) {
+                        spdlog::info("Cell {}, {} is another cell than a moment ago ({:08X}, was {:08X}): a city's "
+                                     "worldspace and the land around it number their cells alike. Such a cell "
+                                     "starts over; this was the first",
+                                     coordinates->cellX,
+                                     coordinates->cellY,
+                                     cell->GetFormID(),
+                                     known->second.formId);
+                    }
+                    dropCell(key);
+                }
                 if (!s_cells.contains(key)) {
                     Cell fresh;
                     fresh.cellX = coordinates->cellX;
                     fresh.cellY = coordinates->cellY;
                     fresh.formId = cell->GetFormID();
+                    fresh.born = s_epoch;
                     fresh.firstDirtyAt = now;
                     fresh.lastDirtyAt = now;
                     s_cells.emplace(key, std::move(fresh));
@@ -1042,26 +1072,37 @@ void ProjectedGeometry::dropCell(CellKey key)
     retire(found->second.receivers);
     s_cells.erase(found);
 
-    // What its statics put over the cells around it goes with it
+    // What its statics put over the cells around it, and over its own, goes with it
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            const auto neighbor = s_cells.find(keyOf(cellX + offsetX, cellY + offsetY));
-            if (neighbor != s_cells.end() && neighbor->second.layers.erase(key) > 0) {
-                rebuildMap(neighbor->second);
-            }
+            removeLayer(keyOf(cellX + offsetX, cellY + offsetY), key);
         }
     }
 }
 
-void ProjectedGeometry::rebuildMap(Cell& cell)
+void ProjectedGeometry::removeLayer(CellKey target,
+                                    CellKey source)
+{
+    const auto cover = s_covers.find(target);
+    if (cover == s_covers.end() || cover->second.layers.erase(source) == 0) {
+        return; // had nothing there
+    }
+    if (cover->second.layers.empty()) {
+        s_covers.erase(cover);
+    } else {
+        rebuildMap(cover->second);
+    }
+}
+
+void ProjectedGeometry::rebuildMap(Cover& cover)
 {
     std::vector<std::shared_ptr<const ShelterMap::Heights>> layers;
-    layers.reserve(cell.layers.size());
-    for (const auto& [source, layer] : cell.layers) {
+    layers.reserve(cover.layers.size());
+    for (const auto& [source, layer] : cover.layers) {
         layers.push_back(layer);
     }
-    cell.map = ShelterMap::combine(layers);
-    ++cell.mapVersion;
+    cover.map = ShelterMap::combine(layers);
+    cover.version = ++s_coverVersion;
 }
 
 auto ProjectedGeometry::startGather(Clock::time_point now) -> bool
@@ -1324,7 +1365,7 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     }
     Cell& cell = found->second;
     const bool first = cell.epoch == 0;
-    ++cell.epoch;
+    cell.epoch = ++s_epoch;
 
     // References that had 3D without a computed world transform were skipped; look again soon
     if (gather.unready && cell.unreadyRetries < K_MAX_UNREADY_RETRIES) {
@@ -1357,8 +1398,8 @@ auto ProjectedGeometry::fieldStamp(const Cell& cell) -> std::uint64_t
     std::uint64_t stamp = hashMix(STAMP_SEED, cell.epoch);
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            const auto neighbor = s_cells.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
-            stamp = hashMix(stamp, neighbor != s_cells.end() ? neighbor->second.mapVersion + 1 : 0);
+            const auto cover = s_covers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
+            stamp = hashMix(stamp, cover != s_covers.end() ? cover->second.version : 0);
         }
     }
     return stamp != 0 ? stamp : 1; // 0 is "never computed"
@@ -1411,10 +1452,10 @@ void ProjectedGeometry::scheduleReceivers(Clock::time_point now)
         job.field.centerY = cell.cellY;
         for (int offsetY = -1; offsetY <= 1; ++offsetY) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                const auto neighbor = s_cells.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
-                if (neighbor != s_cells.end()) {
+                const auto cover = s_covers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
+                if (cover != s_covers.end()) {
                     job.field.maps.at(static_cast<std::size_t>(((offsetY + 1) * ShelterMap::K_BLOCK) + offsetX + 1))
-                        = neighbor->second.map;
+                        = cover->second.map;
                 }
             }
         }
