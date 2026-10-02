@@ -1648,6 +1648,9 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                              / std::max(1.0F - flatGone, MIN_SPAN),
                          EDGE_MARGIN,
                          1.0F - EDGE_MARGIN);
+        // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
+        // that one shelterFade ends the snow as far in on this material as on any other
+        const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
 
         // A vertex holds snow if it could show any with nothing overhead
         const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
@@ -1663,7 +1666,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
         std::optional<ShelterRefinement::Result> refinement;
         if (shelter) {
             worldPositions(receiver, *layout, positions);
-            bool anyCover = job.field.initialOpenness(positions, normals, receiver.fade, openness);
+            bool anyCover = job.field.initialOpenness(positions, normals, fade, openness);
 
             // The vertex fix, where the profile wants it and the shape can take it: with a vertex
             // under cover there is a fade to follow; without one there may still be a roof edge
@@ -1698,7 +1701,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                                                            measured,
                                                            indices,
                                                            holdsSnowFrom,
-                                                           receiver.fade,
+                                                           fade,
                                                            refinementLimits(vertexCount));
                     if (refinement.has_value()) {
                         indices = refinement->indices;
@@ -1714,7 +1717,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                 // rim would be pulled down to mend the middle of triangles that are no longer
                 // there, and a hard edge left along it. The settling is for the rest - what was
                 // too narrow or too small to test, and every shape the fix is not for
-                job.field.settleOpenness(positions, indices, receiver.fade, edgeOpenness, measured, openness);
+                job.field.settleOpenness(positions, indices, fade, edgeOpenness, measured, openness);
                 facing.resize(positions.size());
                 for (std::size_t index = 0; index < positions.size(); ++index) {
                     facing[index] = layout->hasNormals ? normals[index].z : 1.0F;

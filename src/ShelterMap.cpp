@@ -127,6 +127,17 @@ auto ShelterMap::Slope::ofTriangle(const RE::NiPoint3& first,
     return of(unit.z < 0.0F ? -unit : unit);
 }
 
+auto ShelterMap::Fade::of(float distance,
+                          float edgeOpenness) -> Fade
+{
+    // What the plain falloff is at the depth the edge is to lie at, raised to the power, is the
+    // edge value. Kept off 0 and 1, where no power gets it there
+    constexpr float MIN_EDGE = 0.01F;
+    const float plain = 1.0F - (K_EDGE_DEPTH * K_EDGE_DEPTH * (3.0F - (2.0F * K_EDGE_DEPTH)));
+    const float edge = std::clamp(edgeOpenness, MIN_EDGE, 1.0F - MIN_EDGE);
+    return {.distance = distance, .power = std::log(edge) / std::log(plain)};
+}
+
 auto ShelterMap::Field::topAt(int nodeX,
                               int nodeY) const -> float
 {
@@ -285,16 +296,17 @@ auto ShelterMap::Field::distanceToCover(const RE::NiPoint3& point,
 
 auto ShelterMap::Field::opennessAt(const RE::NiPoint3& point,
                                    const Slope& slope,
-                                   float fade) const -> float
+                                   const Fade& fade) const -> float
 {
     // The fade, plus the spacing depthUnderCover's estimate gives up: a point deep under cover has
     // to be able to reach 0, or nothing ever counts as covered
-    const float depth = depthUnderCover(point, slope, fade + K_SPACING);
+    const float depth = depthUnderCover(point, slope, fade.distance + K_SPACING);
     if (depth <= 0.0F) {
         return 1.0F;
     }
-    const float t = fade > 0.0F ? std::clamp(depth / fade, 0.0F, 1.0F) : 1.0F;
-    return 1.0F - (t * t * (3.0F - (2.0F * t)));
+    // A smooth step down over the distance, bent to the material (Fade)
+    const float t = fade.distance > 0.0F ? std::clamp(depth / fade.distance, 0.0F, 1.0F) : 1.0F;
+    return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), fade.power);
 }
 
 auto ShelterMap::Field::overhead(float minX,
@@ -327,7 +339,7 @@ auto ShelterMap::Field::overhead(float minX,
 
 auto ShelterMap::Field::initialOpenness(std::span<const RE::NiPoint3> positions,
                                         std::span<const RE::NiPoint3> normals,
-                                        float fade,
+                                        const Fade& fade,
                                         std::vector<float>& openness) const -> bool
 {
     openness.assign(positions.size(), 1.0F);
@@ -342,7 +354,7 @@ auto ShelterMap::Field::initialOpenness(std::span<const RE::NiPoint3> positions,
 
 void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
                                        std::span<const std::uint16_t> indices,
-                                       float fade,
+                                       const Fade& fade,
                                        float edgeOpenness,
                                        const std::vector<bool>& measured,
                                        std::vector<float>& openness) const
@@ -445,7 +457,8 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
         // Interpolated openness runs from 1 at the open end to the covered vertex's value; it has
         // to pass edgeOpenness at the target fraction, which fixes that value
         constexpr float MIN_TARGET = 0.05F;
-        const float target = std::clamp(inTheOpen(open, covered, slope) + (0.5F * fade / length), MIN_TARGET, 1.0F);
+        const float target
+            = std::clamp(inTheOpen(open, covered, slope) + (K_EDGE_DEPTH * fade.distance / length), MIN_TARGET, 1.0F);
         const float needed = 1.0F - ((1.0F - edgeOpenness) / target);
         if (!stands(covered)) {
             openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));
@@ -482,7 +495,7 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
     // and keeps its snow, whatever a long edge under a roof asks of it; an edge running along an
     // eave anchors nothing, its whole length being close to cover. An edge whose covered end is
     // itself above edgeOpenness is snowy to that end and beyond the open end's reach.
-    const float dripLineReach = std::max(0.5F * fade, K_SPACING);
+    const float dripLineReach = std::max(0.5F * fade.distance, K_SPACING);
     std::vector<float> wanted(positions.size(), 1.0F); // the lowest value any overrun asks of an open vertex
     for (const auto& overrun : overruns) {
         const float coveredEnd = openness[overrun.covered];

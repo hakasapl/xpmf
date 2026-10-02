@@ -109,8 +109,8 @@ public:
         std::size_t maxTriangles {}; /**< Triangles the refined shape may have in all */
     };
 
-    constexpr static float K_TOLERANCE = 0.1F; /**< Of the way from bare to snowed. On the steepest part of the fade
-                                                  this moves the snow's edge by a fifteenth of the fade. The
+    constexpr static float K_TOLERANCE = 0.1F; /**< Of the way from bare to snowed. Where the snow's edge lies on the
+                                                  fade this moves it by about a fifteenth of the fade. The
                                                   lattice locates a drip line no better than that, but what shows
                                                   is not where the edge is: it is two triangles, or two pieces of
                                                   a walkway, disagreeing about it, and at 0.15 the fan a floor is
@@ -138,7 +138,8 @@ public:
      * @param indices The shape's triangle list
      * @param holdsSnowFrom The facing (dot(normal, up)) from which a vertex can hold snow: only
      *        triangles with such a corner are refined
-     * @param fade The profile's shelterFade
+     * @param fade How openness falls off under cover on the shape's material, as the caller's
+     *        Field::initialOpenness read it
      * @param limits How far to go
      * @return std::optional<Result> std::nullopt when nothing was split (the three arrays are then
      *         unchanged)
@@ -151,7 +152,7 @@ public:
                                      std::vector<bool>& measured,
                                      std::span<const std::uint16_t> indices,
                                      float holdsSnowFrom,
-                                     float fade,
+                                     const ShelterMap::Fade& fade,
                                      const Limits& limits) -> std::optional<Result>;
 };
 

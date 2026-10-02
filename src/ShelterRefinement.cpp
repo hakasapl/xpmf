@@ -151,7 +151,7 @@ public:
             std::vector<float>& openness,
             std::vector<bool>& measured,
             float holdsSnowFrom,
-            float fade,
+            const ShelterMap::Fade& fade,
             const ShelterRefinement::Limits& limits)
         : m_field(field)
         , m_model(model)
@@ -1076,7 +1076,7 @@ private:
     std::vector<float>& m_openness;
     std::vector<bool>& m_measured;
     float m_holdsSnowFrom;
-    float m_fade;
+    ShelterMap::Fade m_fade;
     const ShelterRefinement::Limits& m_limits;
     std::size_t m_sourceCount;
 
@@ -1101,7 +1101,7 @@ auto ShelterRefinement::refine(const ShelterMap::Field& field,
                                std::vector<bool>& measured,
                                std::span<const std::uint16_t> indices,
                                float holdsSnowFrom,
-                               float fade,
+                               const ShelterMap::Fade& fade,
                                const Limits& limits) -> std::optional<Result>
 {
     measured.assign(positions.size(), false);

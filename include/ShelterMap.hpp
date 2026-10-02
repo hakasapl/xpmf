@@ -51,6 +51,9 @@ public:
                                                    fits under */
     constexpr static float K_NOTHING = std::numeric_limits<float>::lowest(); /**< Node no triangle covers */
     constexpr static int K_EDGE_SAMPLES = 12; /**< Points tested along a triangle edge that crosses a drip line */
+    constexpr static float K_EDGE_DEPTH = 0.5F; /**< The share of the fade distance, in from the drip line, at which
+                                                   the projection is visibly half gone on a flat surface, whatever
+                                                   the material (see Fade) */
 
     using Heights = std::vector<float>; /**< K_NODES x K_NODES top surface heights, row major (y, then x) */
 
@@ -108,6 +111,30 @@ public:
     };
 
     /**
+     * @brief How the projection falls off under cover: over what distance, and along what curve
+     *
+     * Openness falls from 1 at the drip line to 0 one distance in. What shows of that is the
+     * material's business: snow is visibly gone where openness passes the material's edge value,
+     * and that value runs from 0.2 on a rock that holds snow at any tilt to 0.7 on a table top.
+     * On one curve for all, one shelterFade would end the snow 0.7 of the way in on the rock and
+     * 0.4 of the way in on the table standing next to it. So the curve is bent to the material:
+     * the plain falloff - a smooth step, a half at half the distance - is raised to the power
+     * that takes it through the edge value at K_EDGE_DEPTH of the distance. The snow's edge then
+     * lies there on everything, which is where settleOpenness has always aimed to put it.
+     */
+    struct Fade {
+        float distance {}; /**< World units under cover over which openness falls to 0; 0 is a hard edge */
+        float power {1.0F}; /**< What the plain falloff is raised to; 1 leaves it plain */
+
+        /**
+         * @param distance The profile's shelterFade
+         * @param edgeOpenness Openness at which snow visibly ends on a flat surface of the material
+         */
+        [[nodiscard]] static auto of(float distance,
+                                     float edgeOpenness) -> Fade;
+    };
+
+    /**
      * @brief The 3x3 block of finished maps around a cell, immutable and safe to read on the worker
      */
     struct Field {
@@ -135,13 +162,13 @@ public:
          * @param positions World space vertex positions
          * @param normals World space vertex normals, one per position, or empty for a mesh
          *        without them (every vertex is then read as lying on a flat surface)
-         * @param fade World units under cover over which openness falls to 0
+         * @param fade How openness falls off under cover on the mesh's material
          * @param openness Out: one value per position
          * @return bool Whether any vertex is under cover
          */
         [[nodiscard]] auto initialOpenness(std::span<const RE::NiPoint3> positions,
                                            std::span<const RE::NiPoint3> normals,
-                                           float fade,
+                                           const Fade& fade,
                                            std::vector<float>& openness) const -> bool;
 
         /**
@@ -158,9 +185,10 @@ public:
          *
          * The third step walks every triangle edge that joins an open and a covered vertex,
          * finds where along it cover actually begins, and raises the covered vertex's openness
-         * just enough that the interpolated value crosses edgeOpenness there (half a fade past
-         * the drip line) rather than somewhere out in the open. It runs after the second, so
-         * whatever that took from a vertex next to the open, the drip line on that edge stays put.
+         * just enough that the interpolated value crosses edgeOpenness where the fade itself
+         * does (K_EDGE_DEPTH of its distance past the drip line) rather than somewhere out in the
+         * open. It runs after the second, so whatever that took from a vertex next to the open,
+         * the drip line on that edge stays put.
          *
          * Raising has a floor. A porch plank whose far end is deep under the roof and whose near
          * end pokes a hand's width past the eave interpolates from 1 to 0 over its whole length,
@@ -185,6 +213,7 @@ public:
          * those faces do not have, their own openness is no measurement of what the faces show.
          *
          * @param indices The mesh's triangle list; empty does nothing
+         * @param fade How openness falls off under cover on the mesh's material
          * @param edgeOpenness Openness at which snow visibly ends on the mesh's material
          * @param measured Per vertex, whether its openness is to stand as it is (from
          *        ShelterRefinement::refine); empty for a mesh none of whose vertices are
@@ -192,7 +221,7 @@ public:
          */
         void settleOpenness(std::span<const RE::NiPoint3> positions,
                             std::span<const std::uint16_t> indices,
-                            float fade,
+                            const Fade& fade,
                             float edgeOpenness,
                             const std::vector<bool>& measured,
                             std::vector<float>& openness) const;
@@ -201,11 +230,11 @@ public:
          * @brief Openness (1 in the open .. 0 deep under cover) of one world space point
          *
          * @param slope The tilt of the surface the point lies on
-         * @param fade World units under cover over which openness falls to 0
+         * @param fade How openness falls off under cover
          */
         [[nodiscard]] auto opennessAt(const RE::NiPoint3& point,
                                       const Slope& slope,
-                                      float fade) const -> float;
+                                      const Fade& fade) const -> float;
 
         /**
          * @brief What the columns over a world space rectangle hold, at a glance

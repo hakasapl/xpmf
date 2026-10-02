@@ -114,7 +114,7 @@
             "minimum": 0,
             "maximum": 128,
             "default": 64,
-            "description": "World units over which the projection fades out under cover: 0 is a hard edge at the drip line, 64 about how far wind carries snow in under an eave."
+            "description": "World units over which the projection fades out under cover: 0 is a hard edge at the drip line, 64 about how far wind carries snow in under an eave. Whatever the material, the projection is visibly half gone half way through."
         },
         "specularMult": {
             "type": ["number", "null"],
