@@ -62,7 +62,9 @@ namespace XPMF {
  *    static shape an occluder (the CPU vertex and index copies the engine keeps for decals),
  *    for every snow-projected shape a receiver. Both pin what they point at. A cell is
  *    gathered once references have stopped loading into it for K_QUIET_PERIOD, and once more
- *    after K_SETTLE_RECHECK, because 3D streams in for seconds after a cell attaches. Behind a
+ *    after K_SETTLE_RECHECK, because 3D streams in for seconds after a cell attaches. A gather
+ *    that finds what the last one left sets no judging off: the cell's receivers keep their last
+ *    judgement, and height layers that come back as they were leave their maps as they are. Behind a
  *    loading screen nothing is seen until it goes, so the pass hurries while one is up: shorter
  *    waits, longer slices, the worker at normal priority - the point being that what is under a
  *    roof is bare by the time the screen fades in, not a second after.
@@ -240,6 +242,13 @@ private:
         bool alphaTest {}; /**< The shape is alpha tested (ShapeView::alphaTest): its threshold follows its alpha */
         std::uint8_t alphaThreshold {}; /**< ...the mesh's threshold, and */
         std::uint8_t currentAlphaThreshold {}; /**< ...the one the shape has now */
+
+        /**
+         * @brief Whether two records say the same of one shape: where it stands, what it was given to
+         * project with, and what it draws just now. Every field is part of that, which is what
+         * lets a gather that finds nothing new leave the last judgement standing (finishGather)
+         */
+        auto operator==(const Receiver&) const -> bool = default;
     };
 
     struct RasterJob {
@@ -282,6 +291,8 @@ private:
         std::uint64_t epoch {};
         std::vector<Swap> swaps;
         std::vector<Receiver> receivers; /**< Handed back, current / fingerprint brought up to date */
+        bool unmet {}; /**< Whether a shape could not be given what its cover asks for (the variant budget, a
+                          buffer that could not be made): to be judged again at the next gather, come what may */
     };
 
     using Job = std::variant<RasterJob, ReceiverJob>;
@@ -311,9 +322,11 @@ private:
         bool receiversInFlight {};
         bool everJudged {}; /**< Whether its receivers were ever computed; the first time does not wait for the
                                neighbors' roofs, see scheduleReceivers */
-        std::vector<Receiver> receivers; /**< From the latest gather, unless in flight */
-        Clock::time_point receiversSince; /**< When they were gathered, for K_RECEIVER_TIMEOUT */
-        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against */
+        std::vector<Receiver> receivers; /**< Listed by shape. From the latest gather that found anything new
+                                            (finishGather), unless in flight */
+        Clock::time_point receiversSince; /**< When they were last gathered, for K_RECEIVER_TIMEOUT */
+        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against; 0 for never */
+        bool unmet {}; /**< ReceiverResult::unmet of the last judgement */
     };
 
     /**
@@ -656,6 +669,13 @@ private:
     static inline std::atomic<std::size_t> s_refinedTriangles {0}; /**< Triangles they added in all */
     static inline std::atomic<std::size_t> s_refinedProbes {0}; /**< Field lookups the refinement spent in all */
     static inline std::size_t s_loggedRefinedBuilds = 0; /**< s_refinedBuilds as of the last log line; main thread */
+
+    // What the cell pass has done, for the same log line; main thread only
+    static inline std::size_t s_gathers = 0; /**< Gathers finished */
+    static inline std::size_t s_idleGathers = 0; /**< ...that found every receiver as its last judgement left it */
+    static inline std::size_t s_receiverPasses = 0; /**< Receiver jobs handed to the worker */
+    static inline std::size_t s_layers = 0; /**< Height layers that came back from the worker */
+    static inline std::size_t s_sameLayers = 0; /**< ...and were what lay there already */
 
     static inline std::atomic<bool> s_gridChanged {true}; /**< Set by the sink */
     static inline std::atomic<bool> s_loading {false}; /**< Whether a loading screen is up (read in slice): the

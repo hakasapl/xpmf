@@ -92,6 +92,8 @@ public:
         bool fixVertices {}; /**< roofShelterFixVertices: a shape partly under cover may be given the vertices its
                                 cover needs (ShelterRefinement); with shelter, and never on one that keeps its
                                 alpha or draws a LOD prefix of its triangles */
+
+        auto operator==(const Shape&) const -> bool = default;
     };
 
     /**

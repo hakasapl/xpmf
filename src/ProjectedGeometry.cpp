@@ -868,11 +868,17 @@ void ProjectedGeometry::slice()
 
         if (const auto builds = s_refinedBuilds.load(std::memory_order_relaxed); builds != s_loggedRefinedBuilds) {
             spdlog::info("Roof shelter vertex fix: {} refined vertex buffers built so far, adding {} vertices and {} "
-                         "triangles in all over {} field probes",
+                         "triangles in all over {} field probes. Cell pass: {} gathers, {} of them finding nothing "
+                         "new; {} receiver passes; {} of {} height layers came back as they were",
                          builds,
                          s_refinedVertices.load(std::memory_order_relaxed),
                          s_refinedTriangles.load(std::memory_order_relaxed),
-                         s_refinedProbes.load(std::memory_order_relaxed));
+                         s_refinedProbes.load(std::memory_order_relaxed),
+                         s_gathers,
+                         s_idleGathers,
+                         s_receiverPasses,
+                         s_sameLayers,
+                         s_layers);
             s_loggedRefinedBuilds = builds;
         }
     }
@@ -934,8 +940,17 @@ void ProjectedGeometry::drainResults()
                                          raster->cellY + slotY - 1);
                         }
                     }
+                    // The same roofs as the gather before found there - which is what a settle recheck
+                    // comes to on a cell whose 3D had all arrived - change nothing over that cell:
+                    // its map keeps its version, and nothing under it is judged again on their account
+                    ++s_layers;
                     Cover& cover = s_covers[target];
-                    cover.layers[raster->source] = std::move(layer);
+                    auto& kept = cover.layers[raster->source];
+                    if (kept != nullptr && *kept == *layer) {
+                        ++s_sameLayers;
+                        continue;
+                    }
+                    kept = std::move(layer);
                     rebuildMap(cover);
                 }
             }
@@ -954,6 +969,7 @@ void ProjectedGeometry::drainResults()
         cell->second.receiversInFlight = false;
         if (computed.epoch == cell->second.epoch) {
             cell->second.receivers = std::move(computed.receivers);
+            cell->second.unmet = computed.unmet;
         } else {
             retire(computed.receivers); // a newer gather already replaced them
         }
@@ -1366,6 +1382,7 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     Cell& cell = found->second;
     const bool first = cell.epoch == 0;
     cell.epoch = ++s_epoch;
+    ++s_gathers;
 
     // References that had 3D without a computed world transform were skipped; look again soon
     if (gather.unready && cell.unreadyRetries < K_MAX_UNREADY_RETRIES) {
@@ -1376,10 +1393,28 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
         cell.recheckAt = now + K_SETTLE_RECHECK;
     }
 
-    retire(cell.receivers);
-    cell.receivers = std::move(gather.receivers);
+    // Listed by shape, so that two gathers that found the same shapes list them alike, however
+    // the cell's references happened to be walked
+    std::ranges::sort(gather.receivers, {}, [](const Receiver& receiver) -> const RE::BSTriShape* {
+        return receiver.keepAlive.get();
+    });
+
+    // A gather that finds every shape where the last one did, with the same to project with and
+    // drawing what the last judgement left it, brings nothing to judge: the receivers that are
+    // there stay, and with them what they were last computed against. That is what the settle
+    // recheck comes to on a cell whose 3D had all arrived, and it used to cost the cell a
+    // judgement and, through the map versions its raster bumped, one each to the eight cells
+    // around it. Not while a judgement is out (there is nothing here to hold the gather against),
+    // and not after one that had to leave a shape short of what it should have got
+    if (!first && !cell.receiversInFlight && !cell.unmet && gather.receivers == cell.receivers) {
+        ++s_idleGathers;
+        retire(gather.receivers);
+    } else {
+        retire(cell.receivers);
+        cell.receivers = std::move(gather.receivers);
+        cell.computedAgainst = 0;
+    }
     cell.receiversSince = now;
-    cell.computedAgainst = 0;
 
     if (!ConfigLoader::isAnyRoofSheltered()) {
         return; // nothing was gathered to rasterize
@@ -1394,8 +1429,10 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
 
 auto ProjectedGeometry::fieldStamp(const Cell& cell) -> std::uint64_t
 {
+    // Of what stands over the cells around it, and nothing else: a gather that brings new receivers
+    // says so itself (finishGather), and one that brings none is no reason to judge again
     constexpr std::uint64_t STAMP_SEED = 0x5EED; /**< Any non-zero start */
-    std::uint64_t stamp = hashMix(STAMP_SEED, cell.epoch);
+    std::uint64_t stamp = STAMP_SEED;
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
             const auto cover = s_covers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
@@ -1464,6 +1501,7 @@ void ProjectedGeometry::scheduleReceivers(Clock::time_point now)
         cell.receiversInFlight = true;
         cell.everJudged = true;
         cell.computedAgainst = stamp;
+        ++s_receiverPasses;
         submit(std::move(job));
     }
 }
@@ -1809,6 +1847,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                     // The refined buffer could not be had (the budget, or a failed creation): the
                     // mask on the model's own vertices is still the better part of the fix
                     wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
+                    result.unmet = true;
                 }
             } else {
                 wanted = ProjectedVertexData::custom(receiver.shape, values);
@@ -1816,10 +1855,12 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             if (wanted == nullptr) {
                 wanted = ProjectedVertexData::shared(receiver.shape); // over budget
                 alphaThreshold = receiver.alphaThreshold;
+                result.unmet = true;
             }
         }
 
         if (wanted == nullptr) {
+            result.unmet = true;
             continue; // no vertex data could be built for it
         }
         if (wanted == receiver.current && projected == receiver.projected
