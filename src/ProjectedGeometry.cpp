@@ -575,6 +575,27 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     if (geometry.skinInstance != nullptr || data == nullptr || data->rawVertexData == nullptr) {
         return std::nullopt;
     }
+    // ...and both of their D3D buffers. A shape that has lost one draws nothing, and the engine's
+    // CreateTriShape takes its reference on the index buffer without asking whether there is one
+    // (a crash report of 2026-10-02, on a DynDOLOD LOD model)
+    if (data->vertexBuffer == nullptr || data->indexBuffer == nullptr) {
+        static std::atomic<bool> loggedBufferless {false};
+        if (!loggedBufferless.exchange(true)) {
+            const RE::NiAVObject* root = shape;
+            while (root->parent != nullptr) {
+                root = root->parent;
+            }
+            const auto nameOf = [](const RE::NiAVObject& node) -> const char* {
+                return node.name.empty() ? "(unnamed)" : node.name.c_str();
+            };
+            spdlog::warn("Shape '{}' of '{}' has no {} buffer on the GPU and is left as it is: the engine takes a "
+                         "reference on both without looking. This was the first such shape",
+                         nameOf(*shape),
+                         nameOf(*root),
+                         data->vertexBuffer == nullptr ? "vertex" : "index");
+        }
+        return std::nullopt;
+    }
 
     // Solid, lit surfaces only: effect shaders are fog, glow and light shafts, and the
     // landscape / LOD flags mark terrain and LOD

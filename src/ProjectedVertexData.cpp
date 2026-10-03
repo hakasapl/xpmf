@@ -521,8 +521,9 @@ auto ProjectedVertexData::build(const Shape& shape,
 {
     const Data& source = *shape.source;
     const auto sourceLayout = VertexLayout::from(source.vertexDesc);
-    if (!sourceLayout.has_value() || source.rawVertexData == nullptr || shape.vertexCount == 0) {
-        return nullptr;
+    if (!sourceLayout.has_value() || source.rawVertexData == nullptr || source.indexBuffer == nullptr
+        || shape.vertexCount == 0) {
+        return nullptr; // the engine's CreateTriShape takes a reference on the index buffer without looking
     }
     const ShelterRefinement::Result* const refinement = recipe.refinement;
     const std::size_t added = refinement != nullptr ? refinement->added.size() : 0;

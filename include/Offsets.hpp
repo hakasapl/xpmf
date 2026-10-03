@@ -14,7 +14,8 @@ namespace XPMF::Offsets {
  * into a CPU side rawVertexData (same allocator; the caller keeps its own buffer), creates the
  * D3D11 vertex buffer from it, stores the descriptor, starts the reference count at 1, and
  * takes the index buffer by reading one ID3D11Buffer* through the last argument and AddRef-ing
- * it - so the address of another TriShape's indexBuffer member shares that shape's indices.
+ * it, with no null check (a crash report of 2026-10-02: a DynDOLOD LOD shape without one) - so
+ * the address of another TriShape's indexBuffer member shares that shape's indices.
  * rawIndexData is left null. Same IDs SmoothTerrain builds its land meshes with.
  * 1.5.97: 0xD6BD10. 1.6.1170: 0xE46170. 1.7.99: 0x100B710.
  */
