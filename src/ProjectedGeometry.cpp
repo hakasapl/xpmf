@@ -6,6 +6,7 @@
 #include "ProjectedVertexData.hpp"
 #include "SeasonsOfSkyrim.hpp"
 #include "ShelterMap.hpp"
+#include "ShelterRefinement.hpp"
 #include "Text.hpp"
 #include "VertexLayout.hpp"
 
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -205,13 +207,14 @@ void ProjectedGeometry::onMaterialsReady(Materials materials,
     for (const auto& profile : ConfigLoader::getProfiles()) {
         spdlog::info(
             "Geometry pass: profile '{}' has {} material objects (vertex colors: {}, neutralize vertex alpha: {}, "
-            "roof shelter: {})",
+            "roof shelter: {}, roof shelter fix vertices: {})",
             profile.name,
             std::ranges::count_if(s_materials,
                                   [&](const auto& item) -> bool { return item.second.profile == &profile; }),
             profile.neutralizeVertexColors,
             profile.neutralizeVertexAlpha,
-            profile.roofShelter);
+            profile.roofShelter,
+            profile.roofShelter && profile.roofShelterFixVertices);
     }
 }
 
@@ -247,9 +250,11 @@ auto ProjectedGeometry::settingsOf(const Treatment& treatment,
     const auto named = [&](std::unordered_set<const RE::TESForm*> Kept::* list) -> bool {
         return kept != s_kept.end() && base != nullptr && (kept->second.*list).contains(base);
     };
+    const bool shelter = profile.roofShelter && !named(&Kept::shelter);
     return {.neutralizeColors = profile.neutralizeVertexColors && !named(&Kept::colors),
             .neutralizeAlpha = profile.neutralizeVertexAlpha && !named(&Kept::alpha),
-            .shelter = profile.roofShelter && !named(&Kept::shelter),
+            .shelter = shelter,
+            .fixVertices = shelter && profile.roofShelterFixVertices,
             .specularMult = profile.specularMult};
 }
 
@@ -515,7 +520,8 @@ void ProjectedGeometry::dressClone(RE::NiAVObject& root,
                                                       .keepAlpha = shape->keepAlpha,
                                                       .neutralize = settings.neutralizeColors,
                                                       .shelter = settings.shelter,
-                                                      .neutralizeAlpha = settings.neutralizeAlpha};
+                                                      .neutralizeAlpha = settings.neutralizeAlpha,
+                                                      .fixVertices = settings.fixVertices && shape->refinable};
         if (auto* const variant = ProjectedVertexData::shared(description); variant != nullptr) {
             ProjectedVertexData::install(*shape->shape, variant);
         }
@@ -584,7 +590,15 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     // ...with a rigid static's vertex layout
     const auto layout = VertexLayout::from(data->vertexDesc);
     const auto& counts = shape->GetTrishapeRuntimeData();
-    if (!layout.has_value() || counts.vertexCount == 0 || counts.triangleCount == 0) {
+    std::uint32_t vertexCount = counts.vertexCount;
+    std::uint32_t triangleCount = counts.triangleCount;
+    // A shape drawing a refined variant counts that variant's vertices and triangles; what
+    // everything here reads and rebuilds from is the model's, which the registry remembers
+    if (const auto model = ProjectedVertexData::sourceCountsOf(data); model.has_value()) {
+        vertexCount = model->vertices;
+        triangleCount = model->triangles;
+    }
+    if (!layout.has_value() || vertexCount == 0 || triangleCount == 0) {
         return std::nullopt;
     }
     // Alpha that is looked at for transparency is not this plugin's to rewrite - unless all it is
@@ -596,7 +610,7 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     bool keepAlpha = false;
     RE::NiAlphaProperty* alphaTest = nullptr;
     if (auto* const alpha = geometry.alphaProperty.get(); alpha != nullptr) {
-        if (isPlainAlphaTest(*alpha) && !paintsAlpha(*ProjectedVertexData::sourceOf(data), counts.vertexCount)) {
+        if (isPlainAlphaTest(*alpha) && !paintsAlpha(*ProjectedVertexData::sourceOf(data), vertexCount)) {
             alphaTest = alpha;
         } else {
             keepAlpha = true;
@@ -605,10 +619,10 @@ auto ProjectedGeometry::view(RE::NiAVObject& object) -> std::optional<ShapeView>
     return ShapeView {.shape = shape,
                       .shader = shader,
                       .data = data,
-                      .layout = *layout,
-                      .vertexCount = counts.vertexCount,
-                      .triangleCount = counts.triangleCount,
+                      .vertexCount = vertexCount,
+                      .triangleCount = triangleCount,
                       .keepAlpha = keepAlpha,
+                      .refinable = type == RE::BSGeometry::Type::kTriShape,
                       .alphaTest = alphaTest};
 }
 
@@ -851,6 +865,22 @@ void ProjectedGeometry::slice()
         std::erase_if(s_alphaTests, [](const auto& item) -> bool { return item.second.property->GetRefCount() <= 1; });
         std::erase_if(s_switchedOff, [](const auto& item) -> bool { return item.second->GetRefCount() <= 1; });
         s_nextGarbage = now + K_GARBAGE_INTERVAL;
+
+        if (const auto builds = s_refinedBuilds.load(std::memory_order_relaxed); builds != s_loggedRefinedBuilds) {
+            spdlog::info("Roof shelter vertex fix: {} refined vertex buffers built so far, adding {} vertices and {} "
+                         "triangles in all over {} field probes. Cell pass: {} gathers, {} of them finding nothing "
+                         "new; {} receiver passes; {} of {} height layers came back as they were",
+                         builds,
+                         s_refinedVertices.load(std::memory_order_relaxed),
+                         s_refinedTriangles.load(std::memory_order_relaxed),
+                         s_refinedProbes.load(std::memory_order_relaxed),
+                         s_gathers,
+                         s_idleGathers,
+                         s_receiverPasses,
+                         s_sameLayers,
+                         s_layers);
+            s_loggedRefinedBuilds = builds;
+        }
     }
 
     s_lastSliceEnd.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
@@ -880,27 +910,48 @@ void ProjectedGeometry::drainResults()
     for (auto& result : results) {
         if (auto* const raster = std::get_if<RasterResult>(&result); raster != nullptr) {
             retire(raster->retired);
+            // A cell is not gathered again while its raster is out, so a result that is not of the
+            // cell's own last gather is one of a cell that has gone since - whatever stands under
+            // its key by now
             const auto source = s_cells.find(raster->source);
-            if (source == s_cells.end()) {
+            if (source == s_cells.end() || raster->epoch != source->second.epoch) {
                 continue;
             }
             source->second.rasterInFlight = false;
-            if (raster->epoch != source->second.epoch) {
-                continue; // gathered again since; that job's layers are the ones to keep
-            }
+            // Over every cell of the block, loaded or not: the building whose reference is in this
+            // cell may stand in the next, and that one may load later or never (Cover)
             for (int slotY = 0; slotY < ShelterMap::K_BLOCK; ++slotY) {
                 for (int slotX = 0; slotX < ShelterMap::K_BLOCK; ++slotX) {
-                    const auto target = s_cells.find(keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1));
-                    if (target == s_cells.end()) {
+                    const CellKey target = keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1);
+                    auto& layer = raster->layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
+                    if (layer == nullptr) {
+                        removeLayer(target, raster->source);
                         continue;
                     }
-                    auto& layer = raster->layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
-                    if (layer != nullptr) {
-                        target->second.layers[raster->source] = std::move(layer);
-                    } else if (target->second.layers.erase(raster->source) == 0) {
-                        continue; // had nothing there before either
+                    if (!s_cells.contains(target)) {
+                        static std::atomic<bool> loggedBeyond {false};
+                        if (!loggedBeyond.exchange(true)) {
+                            spdlog::info("The statics of cell {}, {} stand over cell {}, {}, which is not loaded; what "
+                                         "they put over it is kept for when it is, and for their own shapes there. "
+                                         "This was the first such cell",
+                                         raster->cellX,
+                                         raster->cellY,
+                                         raster->cellX + slotX - 1,
+                                         raster->cellY + slotY - 1);
+                        }
                     }
-                    rebuildMap(target->second);
+                    // The same roofs as the gather before found there - which is what a settle recheck
+                    // comes to on a cell whose 3D had all arrived - change nothing over that cell:
+                    // its map keeps its version, and nothing under it is judged again on their account
+                    ++s_layers;
+                    Cover& cover = s_covers[target];
+                    auto& kept = cover.layers[raster->source];
+                    if (kept != nullptr && *kept == *layer) {
+                        ++s_sameLayers;
+                        continue;
+                    }
+                    kept = std::move(layer);
+                    rebuildMap(cover);
                 }
             }
             continue;
@@ -911,13 +962,14 @@ void ProjectedGeometry::drainResults()
             s_swaps.push_back(std::move(swap));
         }
         const auto cell = s_cells.find(computed.cell);
-        if (cell == s_cells.end()) {
-            retire(computed.receivers);
+        if (cell == s_cells.end() || computed.epoch <= cell->second.born) {
+            retire(computed.receivers); // its cell has gone since, whatever stands under its key by now
             continue;
         }
         cell->second.receiversInFlight = false;
         if (computed.epoch == cell->second.epoch) {
             cell->second.receivers = std::move(computed.receivers);
+            cell->second.unmet = computed.unmet;
         } else {
             retire(computed.receivers); // a newer gather already replaced them
         }
@@ -977,11 +1029,29 @@ void ProjectedGeometry::scanGrid(Clock::time_point now)
                 }
                 const CellKey key = keyOf(coordinates->cellX, coordinates->cellY);
                 loaded.insert(key);
+                // A city's worldspace shares its coordinates with the land around it: through the
+                // gate, the grid may hold another cell under a key before a scan ever saw the key
+                // gone. What was known under it was the other cell's
+                if (const auto known = s_cells.find(key);
+                    known != s_cells.end() && known->second.formId != cell->GetFormID()) {
+                    static std::atomic<bool> loggedTakeover {false};
+                    if (!loggedTakeover.exchange(true)) {
+                        spdlog::info("Cell {}, {} is another cell than a moment ago ({:08X}, was {:08X}): a city's "
+                                     "worldspace and the land around it number their cells alike. Such a cell "
+                                     "starts over; this was the first",
+                                     coordinates->cellX,
+                                     coordinates->cellY,
+                                     cell->GetFormID(),
+                                     known->second.formId);
+                    }
+                    dropCell(key);
+                }
                 if (!s_cells.contains(key)) {
                     Cell fresh;
                     fresh.cellX = coordinates->cellX;
                     fresh.cellY = coordinates->cellY;
                     fresh.formId = cell->GetFormID();
+                    fresh.born = s_epoch;
                     fresh.firstDirtyAt = now;
                     fresh.lastDirtyAt = now;
                     s_cells.emplace(key, std::move(fresh));
@@ -1018,26 +1088,37 @@ void ProjectedGeometry::dropCell(CellKey key)
     retire(found->second.receivers);
     s_cells.erase(found);
 
-    // What its statics put over the cells around it goes with it
+    // What its statics put over the cells around it, and over its own, goes with it
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            const auto neighbor = s_cells.find(keyOf(cellX + offsetX, cellY + offsetY));
-            if (neighbor != s_cells.end() && neighbor->second.layers.erase(key) > 0) {
-                rebuildMap(neighbor->second);
-            }
+            removeLayer(keyOf(cellX + offsetX, cellY + offsetY), key);
         }
     }
 }
 
-void ProjectedGeometry::rebuildMap(Cell& cell)
+void ProjectedGeometry::removeLayer(CellKey target,
+                                    CellKey source)
+{
+    const auto cover = s_covers.find(target);
+    if (cover == s_covers.end() || cover->second.layers.erase(source) == 0) {
+        return; // had nothing there
+    }
+    if (cover->second.layers.empty()) {
+        s_covers.erase(cover);
+    } else {
+        rebuildMap(cover->second);
+    }
+}
+
+void ProjectedGeometry::rebuildMap(Cover& cover)
 {
     std::vector<std::shared_ptr<const ShelterMap::Heights>> layers;
-    layers.reserve(cell.layers.size());
-    for (const auto& [source, layer] : cell.layers) {
+    layers.reserve(cover.layers.size());
+    for (const auto& [source, layer] : cover.layers) {
         layers.push_back(layer);
     }
-    cell.map = ShelterMap::combine(layers);
-    ++cell.mapVersion;
+    cover.map = ShelterMap::combine(layers);
+    cover.version = ++s_coverVersion;
 }
 
 auto ProjectedGeometry::startGather(Clock::time_point now) -> bool
@@ -1215,13 +1296,18 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
             return;
         }
 
-        if (shelter && shape->data->rawIndexData != nullptr) {
-            ProjectedVertexData::addRef(shape->data);
+        // The model's own data is what is rasterized: the same surface as any variant of it, with
+        // the counts the view reports (a refined variant has more of both) and with the model's
+        // own layout (a variant may carry a color the model has not, and a stride to match)
+        Data* const source = ProjectedVertexData::sourceOf(shape->data);
+        const auto sourceLayout = VertexLayout::from(source->vertexDesc);
+        if (shelter && sourceLayout.has_value() && source->rawIndexData != nullptr) {
+            ProjectedVertexData::addRef(source);
             gather.occluders.push_back({.keepAlive = RE::NiPointer<RE::BSTriShape> {shape->shape},
-                                        .pinned = shape->data,
+                                        .pinned = source,
                                         .vertexCount = shape->vertexCount,
                                         .triangleCount = shape->triangleCount,
-                                        .layout = shape->layout,
+                                        .layout = *sourceLayout,
                                         .world = shape->shape->world});
         }
 
@@ -1253,7 +1339,6 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         const float cosAngle = projection.alpha;
         const float threshold = ((1.0F - cosAngle) * projection.green) + cosAngle;
         const float noiseAmplitude = (1.0F - cosAngle) * projection.red;
-        Data* const source = ProjectedVertexData::sourceOf(shape->data);
         ProjectedVertexData::addRef(source);
         gather.receivers.push_back(
             {.keepAlive = RE::NiPointer<RE::BSTriShape> {shape->shape},
@@ -1264,7 +1349,8 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
                        .keepAlpha = shape->keepAlpha,
                        .neutralize = settings.neutralizeColors,
                        .shelter = settings.shelter,
-                       .neutralizeAlpha = settings.neutralizeAlpha},
+                       .neutralizeAlpha = settings.neutralizeAlpha,
+                       .fixVertices = settings.fixVertices && shape->refinable},
              .current = shape->data,
              .projected = shape->shader->flags.any(ShaderFlag::kProjectedUV),
              .currentFingerprint = ProjectedVertexData::fingerprintOf(shape->data),
@@ -1295,7 +1381,8 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     }
     Cell& cell = found->second;
     const bool first = cell.epoch == 0;
-    ++cell.epoch;
+    cell.epoch = ++s_epoch;
+    ++s_gathers;
 
     // References that had 3D without a computed world transform were skipped; look again soon
     if (gather.unready && cell.unreadyRetries < K_MAX_UNREADY_RETRIES) {
@@ -1306,10 +1393,28 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
         cell.recheckAt = now + K_SETTLE_RECHECK;
     }
 
-    retire(cell.receivers);
-    cell.receivers = std::move(gather.receivers);
+    // Listed by shape, so that two gathers that found the same shapes list them alike, however
+    // the cell's references happened to be walked
+    std::ranges::sort(gather.receivers, {}, [](const Receiver& receiver) -> const RE::BSTriShape* {
+        return receiver.keepAlive.get();
+    });
+
+    // A gather that finds every shape where the last one did, with the same to project with and
+    // drawing what the last judgement left it, brings nothing to judge: the receivers that are
+    // there stay, and with them what they were last computed against. That is what the settle
+    // recheck comes to on a cell whose 3D had all arrived, and it used to cost the cell a
+    // judgement and, through the map versions its raster bumped, one each to the eight cells
+    // around it. Not while a judgement is out (there is nothing here to hold the gather against),
+    // and not after one that had to leave a shape short of what it should have got
+    if (!first && !cell.receiversInFlight && !cell.unmet && gather.receivers == cell.receivers) {
+        ++s_idleGathers;
+        retire(gather.receivers);
+    } else {
+        retire(cell.receivers);
+        cell.receivers = std::move(gather.receivers);
+        cell.computedAgainst = 0;
+    }
     cell.receiversSince = now;
-    cell.computedAgainst = 0;
 
     if (!ConfigLoader::isAnyRoofSheltered()) {
         return; // nothing was gathered to rasterize
@@ -1324,12 +1429,14 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
 
 auto ProjectedGeometry::fieldStamp(const Cell& cell) -> std::uint64_t
 {
+    // Of what stands over the cells around it, and nothing else: a gather that brings new receivers
+    // says so itself (finishGather), and one that brings none is no reason to judge again
     constexpr std::uint64_t STAMP_SEED = 0x5EED; /**< Any non-zero start */
-    std::uint64_t stamp = hashMix(STAMP_SEED, cell.epoch);
+    std::uint64_t stamp = STAMP_SEED;
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            const auto neighbor = s_cells.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
-            stamp = hashMix(stamp, neighbor != s_cells.end() ? neighbor->second.mapVersion + 1 : 0);
+            const auto cover = s_covers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
+            stamp = hashMix(stamp, cover != s_covers.end() ? cover->second.version : 0);
         }
     }
     return stamp != 0 ? stamp : 1; // 0 is "never computed"
@@ -1382,10 +1489,10 @@ void ProjectedGeometry::scheduleReceivers(Clock::time_point now)
         job.field.centerY = cell.cellY;
         for (int offsetY = -1; offsetY <= 1; ++offsetY) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                const auto neighbor = s_cells.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
-                if (neighbor != s_cells.end()) {
+                const auto cover = s_covers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
+                if (cover != s_covers.end()) {
                     job.field.maps.at(static_cast<std::size_t>(((offsetY + 1) * ShelterMap::K_BLOCK) + offsetX + 1))
-                        = neighbor->second.map;
+                        = cover->second.map;
                 }
             }
         }
@@ -1394,6 +1501,7 @@ void ProjectedGeometry::scheduleReceivers(Clock::time_point now)
         cell.receiversInFlight = true;
         cell.everJudged = true;
         cell.computedAgainst = stamp;
+        ++s_receiverPasses;
         submit(std::move(job));
     }
 }
@@ -1527,13 +1635,9 @@ auto ProjectedGeometry::run(RasterJob& job) -> RasterResult
     return result;
 }
 
-auto ProjectedGeometry::measureOpenness(const Receiver& receiver,
-                                        const ShelterMap::Field& field,
-                                        const VertexLayout& layout,
-                                        std::span<const RE::NiPoint3> normals,
-                                        float edgeOpenness,
-                                        std::vector<RE::NiPoint3>& positions,
-                                        std::vector<float>& openness) -> bool
+void ProjectedGeometry::worldPositions(const Receiver& receiver,
+                                       const VertexLayout& layout,
+                                       std::vector<RE::NiPoint3>& positions)
 {
     const Data& source = *receiver.shape.source;
     const std::uint32_t vertexCount = receiver.shape.vertexCount;
@@ -1544,13 +1648,21 @@ auto ProjectedGeometry::measureOpenness(const Receiver& receiver,
         positions[index] = receiver.world
             * VertexLayout::position(vertices.subspan(static_cast<std::size_t>(index) * layout.stride, layout.stride));
     }
+}
 
-    // A shape without a CPU index list still gets per vertex values, just no edge placement
-    std::span<const std::uint16_t> indices;
-    if (source.rawIndexData != nullptr) {
-        indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
-    }
-    return field.measureOpenness(positions, normals, indices, receiver.fade, edgeOpenness, openness);
+auto ProjectedGeometry::refinementLimits(std::uint32_t vertexCount) -> ShelterRefinement::Limits
+{
+    constexpr std::size_t MAX_COUNT = std::numeric_limits<std::uint16_t>::max(); /**< What a BSTriShape counts to */
+    constexpr std::size_t MIN_ALLOWANCE = 128; /**< Even a plank of four vertices may need a few loops */
+    const std::size_t room = MAX_COUNT - std::min<std::size_t>(vertexCount, MAX_COUNT);
+    return {.tolerance = ShelterRefinement::K_TOLERANCE,
+            .minEdge = ShelterRefinement::K_MIN_EDGE,
+            .minHeight = ShelterRefinement::K_MIN_HEIGHT,
+            .maxRounds = ShelterRefinement::K_MAX_ROUNDS,
+            .maxAddedVertices = std::min({ShelterRefinement::K_MAX_ADDED_VERTICES,
+                                          std::max<std::size_t>(vertexCount, MIN_ALLOWANCE),
+                                          room}),
+            .maxTriangles = MAX_COUNT};
 }
 
 auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
@@ -1563,8 +1675,10 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
     result.epoch = job.epoch;
 
     std::vector<RE::NiPoint3> positions;
+    std::vector<RE::NiPoint3> modelPositions;
     std::vector<RE::NiPoint3> normals;
     std::vector<float> openness;
+    std::vector<bool> measured; // per vertex, whether the vertex fix has its openness in hand
     std::vector<float> facing;
     std::vector<std::uint8_t> values; // per vertex, what the mesh's alpha is scaled by, or becomes
     for (auto& receiver : job.receivers) {
@@ -1613,18 +1727,83 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                              / std::max(1.0F - flatGone, MIN_SPAN),
                          EDGE_MARGIN,
                          1.0F - EDGE_MARGIN);
-
-        facing.resize(vertexCount);
-        for (std::uint32_t index = 0; index < vertexCount; ++index) {
-            facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
-        }
+        // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
+        // that one shelterFade ends the snow as far in on this material as on any other
+        const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
 
         // A vertex holds snow if it could show any with nothing overhead
         const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
+
+        // A shape without a CPU index list still gets per vertex values, just no edge placement
+        // and no refinement
+        std::span<const std::uint16_t> indices;
+        if (source.rawIndexData != nullptr) {
+            indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
+        }
+
         auto verdict = ShelterMap::Verdict::OPEN;
-        if (shelter && measureOpenness(receiver, job.field, *layout, normals, edgeOpenness, positions, openness)) {
-            verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
-                                        !receiver.shape.keepAlpha);
+        std::optional<ShelterRefinement::Result> refinement;
+        if (shelter) {
+            worldPositions(receiver, *layout, positions);
+            bool anyCover = job.field.initialOpenness(positions, normals, fade, openness);
+
+            // The vertex fix, where the profile wants it and the shape can take it: with a vertex
+            // under cover there is a fade to follow; without one there may still be a roof edge
+            // crossing the middle of a triangle, which is worth a look only if any column over
+            // the shape's footprint tops out above it at all
+            measured.clear();
+            if (receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
+                bool worthALook = anyCover;
+                if (!worthALook) {
+                    RE::NiPoint3 low = positions.front();
+                    float maxX = low.x;
+                    float maxY = low.y;
+                    for (const auto& position : positions) {
+                        low.x = std::min(low.x, position.x);
+                        low.y = std::min(low.y, position.y);
+                        low.z = std::min(low.z, position.z);
+                        maxX = std::max(maxX, position.x);
+                        maxY = std::max(maxY, position.y);
+                    }
+                    worthALook = job.field.anyCoverOver(low.x, low.y, maxX, maxY, low.z);
+                }
+                if (worthALook) {
+                    modelPositions.resize(vertexCount);
+                    for (std::uint32_t index = 0; index < vertexCount; ++index) {
+                        modelPositions[index] = VertexLayout::position(vertexAt(index));
+                    }
+                    refinement = ShelterRefinement::refine(job.field,
+                                                           modelPositions,
+                                                           positions,
+                                                           normals,
+                                                           openness,
+                                                           measured,
+                                                           indices,
+                                                           holdsSnowFrom,
+                                                           fade,
+                                                           refinementLimits(vertexCount));
+                    if (refinement.has_value()) {
+                        indices = refinement->indices;
+                        anyCover = anyCover
+                            || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
+                        s_refinedProbes.fetch_add(refinement->probes, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            if (anyCover) {
+                // What the vertex fix tested stands as measured: left to the settling, a floor's
+                // rim would be pulled down to mend the middle of triangles that are no longer
+                // there, and a hard edge left along it. The settling is for the rest - what was
+                // too narrow or too small to test, and every shape the fix is not for
+                job.field.settleOpenness(positions, indices, fade, edgeOpenness, measured, openness);
+                facing.resize(positions.size());
+                for (std::size_t index = 0; index < positions.size(); ++index) {
+                    facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
+                }
+                verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
+                                            !receiver.shape.keepAlpha);
+            }
         }
 
         Data* wanted = nullptr;
@@ -1639,8 +1818,10 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             ProjectedVertexData::addRef(receiver.shape.source);
             wanted = receiver.shape.source;
         } else {
-            values.resize(vertexCount);
-            for (std::uint32_t index = 0; index < vertexCount; ++index) {
+            // One value per vertex of the shape as it will be drawn: the model's, then the added
+            const std::size_t total = openness.size();
+            values.resize(total);
+            for (std::size_t index = 0; index < total; ++index) {
                 const float gone = goneAlpha(facing[index]);
                 values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
             }
@@ -1648,18 +1829,38 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                 // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
                 alphaThreshold = scaledAlphaThreshold(receiver.alphaThreshold, *std::ranges::min_element(values));
             }
-            if (receiver.projected && ProjectedVertexData::fingerprint(values) == receiver.currentFingerprint
+            const std::uint64_t fingerprint = refinement.has_value()
+                ? ProjectedVertexData::fingerprintRefined(values, *refinement)
+                : ProjectedVertexData::fingerprint(values);
+            if (receiver.projected && fingerprint == receiver.currentFingerprint
                 && alphaThreshold == receiver.currentAlphaThreshold) {
                 continue; // what it already has
             }
-            wanted = ProjectedVertexData::custom(receiver.shape, values);
+            if (refinement.has_value()) {
+                wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values);
+                if (wanted != nullptr) {
+                    s_refinedBuilds.fetch_add(1, std::memory_order_relaxed);
+                    s_refinedVertices.fetch_add(refinement->added.size(), std::memory_order_relaxed);
+                    s_refinedTriangles.fetch_add((refinement->indices.size() / 3) - receiver.shape.triangleCount,
+                                                 std::memory_order_relaxed);
+                } else {
+                    // The refined buffer could not be had (the budget, or a failed creation): the
+                    // mask on the model's own vertices is still the better part of the fix
+                    wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
+                    result.unmet = true;
+                }
+            } else {
+                wanted = ProjectedVertexData::custom(receiver.shape, values);
+            }
             if (wanted == nullptr) {
                 wanted = ProjectedVertexData::shared(receiver.shape); // over budget
                 alphaThreshold = receiver.alphaThreshold;
+                result.unmet = true;
             }
         }
 
         if (wanted == nullptr) {
+            result.unmet = true;
             continue; // no vertex data could be built for it
         }
         if (wanted == receiver.current && projected == receiver.projected

@@ -3,6 +3,7 @@
 #include "ConfigLoader.hpp"
 #include "ProjectedVertexData.hpp"
 #include "ShelterMap.hpp"
+#include "ShelterRefinement.hpp"
 #include "VertexLayout.hpp"
 
 #include "PCH.h"
@@ -61,17 +62,22 @@ namespace XPMF {
  *    static shape an occluder (the CPU vertex and index copies the engine keeps for decals),
  *    for every snow-projected shape a receiver. Both pin what they point at. A cell is
  *    gathered once references have stopped loading into it for K_QUIET_PERIOD, and once more
- *    after K_SETTLE_RECHECK, because 3D streams in for seconds after a cell attaches. Behind a
+ *    after K_SETTLE_RECHECK, because 3D streams in for seconds after a cell attaches. A gather
+ *    that finds what the last one left sets no judging off: the cell's receivers keep their last
+ *    judgement, and height layers that come back as they were leave their maps as they are. Behind a
  *    loading screen nothing is seen until it goes, so the pass hurries while one is up: shorter
  *    waits, longer slices, the worker at normal priority - the point being that what is under a
  *    roof is bare by the time the screen fades in, not a second after.
  *  - A below-normal-priority worker rasterizes the occluders into height layers (one per cell
- *    they reach, see ShelterMap) and, once the 3x3 cells around a receiver's cell are quiet,
+ *    they reach, see ShelterMap; each is kept whether the cell it lies over is loaded or not,
+ *    see Cover) and, once the 3x3 cells around a receiver's cell are quiet,
  *    judges each receiver by the vertices that can hold snow (ShelterMap::judge). A cell's first
  *    judgement waits for its own roofs only, its neighbors' coming in over the next seconds and a
  *    second pass following them; every later one waits for the whole neighborhood. In the open ->
  *    keeps the shared variant, partly covered -> a private variant whose alpha fades with the
- *    distance under cover, sheltered -> its projected snow is switched off (the Projected_UV
+ *    distance under cover (and, with the profile's roofShelterFixVertices, with the vertices
+ *    ShelterRefinement adds where the mesh is too coarse to carry that fade), sheltered -> its
+ *    projected snow is switched off (the Projected_UV
  *    and Snow shader flags the engine set in Clone3D are cleared again) and it goes back to the
  *    model's own vertex data - and onto a list (s_switchedOff), since the next gather has to take
  *    it for a receiver still, and nothing on the property tells it from a shape the engine never
@@ -236,6 +242,13 @@ private:
         bool alphaTest {}; /**< The shape is alpha tested (ShapeView::alphaTest): its threshold follows its alpha */
         std::uint8_t alphaThreshold {}; /**< ...the mesh's threshold, and */
         std::uint8_t currentAlphaThreshold {}; /**< ...the one the shape has now */
+
+        /**
+         * @brief Whether two records say the same of one shape: where it stands, what it was given to
+         * project with, and what it draws just now. Every field is part of that, which is what
+         * lets a gather that finds nothing new leave the last judgement standing (finishGather)
+         */
+        auto operator==(const Receiver&) const -> bool = default;
     };
 
     struct RasterJob {
@@ -278,6 +291,8 @@ private:
         std::uint64_t epoch {};
         std::vector<Swap> swaps;
         std::vector<Receiver> receivers; /**< Handed back, current / fingerprint brought up to date */
+        bool unmet {}; /**< Whether a shape could not be given what its cover asks for (the variant budget, a
+                          buffer that could not be made): to be judged again at the next gather, come what may */
     };
 
     using Job = std::variant<RasterJob, ReceiverJob>;
@@ -285,6 +300,10 @@ private:
 
     /**
      * @brief Everything known about one loaded exterior cell; main thread only
+     *
+     * Kept by the cell's coordinates, which are not the cell: a city's worldspace and the land
+     * around it number their cells alike, so the form is kept too, and a key whose cell has
+     * become another one starts over (scanGrid).
      */
     struct Cell {
         int cellX {};
@@ -295,17 +314,37 @@ private:
         Clock::time_point lastDirtyAt;
         std::optional<Clock::time_point> recheckAt; /**< The one unconditional re-gather */
         int unreadyRetries {};
-        std::uint64_t epoch {}; /**< Bumped by every gather; older results are dropped */
+        std::uint64_t born {}; /**< s_epoch when the cell was first seen: a result of an epoch no later than
+                                  that is of whatever stood under its key before */
+        std::uint64_t epoch {}; /**< Of its last gather, 0 before the first; no two gathers of any cell share
+                                   one, and results of another are dropped */
         bool rasterInFlight {};
         bool receiversInFlight {};
         bool everJudged {}; /**< Whether its receivers were ever computed; the first time does not wait for the
                                neighbors' roofs, see scheduleReceivers */
-        std::vector<Receiver> receivers; /**< From the latest gather, unless in flight */
-        Clock::time_point receiversSince; /**< When they were gathered, for K_RECEIVER_TIMEOUT */
+        std::vector<Receiver> receivers; /**< Listed by shape. From the latest gather that found anything new
+                                            (finishGather), unless in flight */
+        Clock::time_point receiversSince; /**< When they were last gathered, for K_RECEIVER_TIMEOUT */
+        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against; 0 for never */
+        bool unmet {}; /**< ReceiverResult::unmet of the last judgement */
+    };
+
+    /**
+     * @brief What stands over one cell's ground: the height layers the loaded cells around it put
+     * there; main thread only
+     *
+     * Kept apart from Cell, because a cell need not be loaded to have a roof put over it. A
+     * building is gathered with the cell its reference is in and stands wherever its model puts
+     * it - across a border, or a whole cell away: Windhelm's Gray Quarter is placed at the edge
+     * of one cell and built in the next. That next cell may load long after the building did, may
+     * lie past the edge of the loaded grid, or may not exist in a walled city's worldspace at
+     * all, and what the building puts over it holds all the same, for as long as the building's
+     * own cell is loaded.
+     */
+    struct Cover {
         std::unordered_map<CellKey, std::shared_ptr<const ShelterMap::Heights>> layers; /**< By source cell */
         std::shared_ptr<const ShelterMap::Heights> map; /**< Maximum over the layers */
-        std::uint64_t mapVersion {}; /**< Bumped whenever map changes */
-        std::uint64_t computedAgainst {}; /**< Field stamp the receivers were last computed against */
+        std::uint64_t version {}; /**< Of map; never 0, and no two maps of any cover ever share one */
     };
 
     /**
@@ -342,6 +381,8 @@ private:
         bool neutralizeColors {}; /**< Its shapes get white vertex colors */
         bool neutralizeAlpha {}; /**< Its shapes start from a vertex alpha of 1 */
         bool shelter {}; /**< Its shapes lose the projection under cover */
+        bool fixVertices {}; /**< Its shapes partly under cover get vertices where the cover changes
+                                (ShelterRefinement); only ever with shelter */
         std::optional<float> specularMult; /**< What its shapes' specular strength is multiplied by; std::nullopt
                                               leaves it (no skip list: the profile's own value or nothing) */
     };
@@ -424,11 +465,12 @@ private:
     struct ShapeView {
         RE::BSTriShape* shape {};
         RE::BSLightingShaderProperty* shader {};
-        Data* data {};
-        VertexLayout layout;
-        std::uint32_t vertexCount {};
+        Data* data {}; /**< What the shape draws with now: the model's data or a variant of it */
+        std::uint32_t vertexCount {}; /**< The model's counts, whatever a refined variant on the shape draws */
         std::uint32_t triangleCount {};
         bool keepAlpha {}; /**< See ProjectedVertexData::Shape::keepAlpha */
+        bool refinable {}; /**< A plain tri shape, whose triangle list may be traded for a longer one: not a mesh
+                              LOD tri shape, which draws a prefix of its list per level */
         RE::NiAlphaProperty* alphaTest {}; /**< The shape's alpha property - the model's, or the shape's own copy of
                                               it (setAlphaThreshold) - when its alpha is tested against a
                                               threshold and nothing else, and the mesh paints none: such a shape
@@ -530,7 +572,14 @@ private:
     static void finishGather(Clock::time_point now);
     static void scheduleReceivers(Clock::time_point now);
     static void dropCell(CellKey key);
-    static void rebuildMap(Cell& cell);
+
+    /**
+     * @brief Takes what a source cell put over a target cell away again, and the cover with it once
+     * nothing is left over that cell
+     */
+    static void removeLayer(CellKey target,
+                            CellKey source);
+    static void rebuildMap(Cover& cover);
     [[nodiscard]] static auto fieldStamp(const Cell& cell) -> std::uint64_t;
     [[nodiscard]] static auto neighborhoodBusy(const Cell& cell) -> bool;
     static void retire(std::vector<Occluder>& occluders);
@@ -548,22 +597,19 @@ private:
     [[nodiscard]] static auto run(ReceiverJob& job) -> ReceiverResult;
 
     /**
-     * @brief Per vertex openness of one receiver: its vertices put into world space and handed to
-     * ShelterMap::Field::measureOpenness, which has the details
+     * @brief The world space positions of a receiver's vertices
      *
-     * @param normals World space vertex normals, or empty for a mesh without them
-     * @param edgeOpenness Openness at which snow visibly ends on a flat surface of this static
-     * @param positions Scratch buffer for the world space positions
-     * @param openness Out: the result
-     * @return bool Whether any vertex is under cover
+     * @param positions Out: one per vertex of the model's shape
      */
-    [[nodiscard]] static auto measureOpenness(const Receiver& receiver,
-                                              const ShelterMap::Field& field,
-                                              const VertexLayout& layout,
-                                              std::span<const RE::NiPoint3> normals,
-                                              float edgeOpenness,
-                                              std::vector<RE::NiPoint3>& positions,
-                                              std::vector<float>& openness) -> bool;
+    static void worldPositions(const Receiver& receiver,
+                               const VertexLayout& layout,
+                               std::vector<RE::NiPoint3>& positions);
+
+    /**
+     * @brief How far ShelterRefinement may go on one shape: its own vertex count again at most
+     * (a coarse mesh needs proportionally more, a fine one nothing), within what a BSTriShape counts
+     */
+    [[nodiscard]] static auto refinementLimits(std::uint32_t vertexCount) -> ShelterRefinement::Limits;
 
     [[nodiscard]] static auto keyOf(int cellX,
                                     int cellY) -> CellKey;
@@ -599,6 +645,9 @@ private:
      */
     static inline std::unordered_map<const RE::BSTriShape*, RE::NiPointer<RE::BSTriShape>> s_switchedOff;
     static inline std::unordered_map<CellKey, Cell> s_cells;
+    static inline std::uint64_t s_epoch = 0; /**< The last Cell::epoch given out */
+    static inline std::unordered_map<CellKey, Cover> s_covers; /**< By the cell covered, loaded or not */
+    static inline std::uint64_t s_coverVersion = 0; /**< The last Cover::version given out */
     static inline std::optional<Gather> s_gather;
     static inline std::vector<Occluder> s_retiredOccluders;
     static inline std::vector<Receiver> s_retiredReceivers;
@@ -613,6 +662,20 @@ private:
     static inline std::deque<Result> s_results;
     static inline std::vector<CellKey> s_touched; /**< Cells a static was cloned into (from the hook) */
     static inline bool s_workerStarted = false;
+
+    // What the vertex fix has done, for the log: counted on the worker, read on the main thread
+    static inline std::atomic<std::size_t> s_refinedBuilds {0}; /**< Refined variants built */
+    static inline std::atomic<std::size_t> s_refinedVertices {0}; /**< Vertices they added in all */
+    static inline std::atomic<std::size_t> s_refinedTriangles {0}; /**< Triangles they added in all */
+    static inline std::atomic<std::size_t> s_refinedProbes {0}; /**< Field lookups the refinement spent in all */
+    static inline std::size_t s_loggedRefinedBuilds = 0; /**< s_refinedBuilds as of the last log line; main thread */
+
+    // What the cell pass has done, for the same log line; main thread only
+    static inline std::size_t s_gathers = 0; /**< Gathers finished */
+    static inline std::size_t s_idleGathers = 0; /**< ...that found every receiver as its last judgement left it */
+    static inline std::size_t s_receiverPasses = 0; /**< Receiver jobs handed to the worker */
+    static inline std::size_t s_layers = 0; /**< Height layers that came back from the worker */
+    static inline std::size_t s_sameLayers = 0; /**< ...and were what lay there already */
 
     static inline std::atomic<bool> s_gridChanged {true}; /**< Set by the sink */
     static inline std::atomic<bool> s_loading {false}; /**< Whether a loading screen is up (read in slice): the

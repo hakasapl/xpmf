@@ -51,6 +51,9 @@ public:
                                                    fits under */
     constexpr static float K_NOTHING = std::numeric_limits<float>::lowest(); /**< Node no triangle covers */
     constexpr static int K_EDGE_SAMPLES = 12; /**< Points tested along a triangle edge that crosses a drip line */
+    constexpr static float K_EDGE_DEPTH = 0.5F; /**< The share of the fade distance, in from the drip line, at which
+                                                   the projection is visibly half gone on a flat surface, whatever
+                                                   the material (see Fade) */
 
     using Heights = std::vector<float>; /**< K_NODES x K_NODES top surface heights, row major (y, then x) */
 
@@ -108,6 +111,30 @@ public:
     };
 
     /**
+     * @brief How the projection falls off under cover: over what distance, and along what curve
+     *
+     * Openness falls from 1 at the drip line to 0 one distance in. What shows of that is the
+     * material's business: snow is visibly gone where openness passes the material's edge value,
+     * and that value runs from 0.2 on a rock that holds snow at any tilt to 0.7 on a table top.
+     * On one curve for all, one shelterFade would end the snow 0.7 of the way in on the rock and
+     * 0.4 of the way in on the table standing next to it. So the curve is bent to the material:
+     * the plain falloff - a smooth step, a half at half the distance - is raised to the power
+     * that takes it through the edge value at K_EDGE_DEPTH of the distance. The snow's edge then
+     * lies there on everything, which is where settleOpenness has always aimed to put it.
+     */
+    struct Fade {
+        float distance {}; /**< World units under cover over which openness falls to 0; 0 is a hard edge */
+        float power {1.0F}; /**< What the plain falloff is raised to; 1 leaves it plain */
+
+        /**
+         * @param distance The profile's shelterFade
+         * @param edgeOpenness Openness at which snow visibly ends on a flat surface of the material
+         */
+        [[nodiscard]] static auto of(float distance,
+                                     float edgeOpenness) -> Fade;
+    };
+
+    /**
      * @brief The 3x3 block of finished maps around a cell, immutable and safe to read on the worker
      */
     struct Field {
@@ -117,31 +144,51 @@ public:
                                                                           yet */
 
         /**
-         * @brief Per vertex openness (1 in the open .. 0 deep under cover) of one mesh
+         * @brief Per vertex openness (1 in the open .. 0 deep under cover) of one mesh, the first
+         * of four steps: every vertex gets the openness of its own spot, read along its own surface
          *
-         * Four steps. Every vertex first gets the openness of its own spot: 1 in the open,
-         * falling to 0 over the fade distance under cover. That alone is only right where the
-         * mesh is fine enough to follow the fade, and game meshes are not - a stair flight is
-         * two rows of vertices, a porch plank has one at either end, a covered walkway's floor
-         * is one polygon with every vertex on its rim - and a vertex value is wrong in both
-         * directions on such a mesh. A covered vertex would drag the interpolated value down
-         * along the whole triangle and strip snow that lies in the open; and a triangle whose
-         * corners all sit a hand's width under an eave, but whose middle lies deep under the
-         * roof, would keep its snow throughout, because nothing ever looks at the middle.
+         * That alone is only right where the mesh is fine enough to follow the fade, and game
+         * meshes are not - a stair flight is two rows of vertices, a porch plank has one at either
+         * end, a covered walkway's floor is one polygon with every vertex on its rim - and a
+         * vertex value is wrong in both directions on such a mesh. A covered vertex would drag
+         * the interpolated value down along the whole triangle and strip snow that lies in the
+         * open; and a triangle whose corners all sit a hand's width under an eave, but whose
+         * middle lies deep under the roof, would keep its snow throughout, because nothing ever
+         * looks at the middle. Two things put that right: ShelterRefinement, where the profile
+         * allows it, adds the vertices such a mesh lacks, and the openness of this step then
+         * stands as it is on every surface it tested; settleOpenness makes the best of the
+         * vertices there are everywhere else.
          *
-         * So the second step looks at the middle: at the centroid and the edge midpoints of
-         * every triangle that has a covered corner, the openness the corners interpolate to is
-         * compared with the openness of that spot, and where the interpolation comes out too
-         * open the covered corners are lowered just enough to close the gap (the excess spread
-         * over them in proportion to their weight there; a corner ends at the lowest value any
-         * probe asked of it). Open corners are never touched, so a triangle that is mostly in
-         * the open keeps its snow there.
+         * @param positions World space vertex positions
+         * @param normals World space vertex normals, one per position, or empty for a mesh
+         *        without them (every vertex is then read as lying on a flat surface)
+         * @param fade How openness falls off under cover on the mesh's material
+         * @param openness Out: one value per position
+         * @return bool Whether any vertex is under cover
+         */
+        [[nodiscard]] auto initialOpenness(std::span<const RE::NiPoint3> positions,
+                                           std::span<const RE::NiPoint3> normals,
+                                           const Fade& fade,
+                                           std::vector<float>& openness) const -> bool;
+
+        /**
+         * @brief The second to fourth steps: the openness of initialOpenness (plus whatever
+         * ShelterRefinement appended) settled against the mesh's triangles
+         *
+         * The second step looks at the middle: at the centroid and the edge midpoints of every
+         * triangle that has a covered corner, the openness the corners interpolate to is compared
+         * with the openness of that spot, and where the interpolation comes out too open the
+         * covered corners are lowered just enough to close the gap (the excess spread over them
+         * in proportion to their weight there; a corner ends at the lowest value any probe asked
+         * of it). Open corners are never touched, so a triangle that is mostly in the open keeps
+         * its snow there.
          *
          * The third step walks every triangle edge that joins an open and a covered vertex,
          * finds where along it cover actually begins, and raises the covered vertex's openness
-         * just enough that the interpolated value crosses edgeOpenness there (half a fade past
-         * the drip line) rather than somewhere out in the open. It runs after the second, so
-         * whatever that took from a vertex next to the open, the drip line on that edge stays put.
+         * just enough that the interpolated value crosses edgeOpenness where the fade itself
+         * does (K_EDGE_DEPTH of its distance past the drip line) rather than somewhere out in the
+         * open. It runs after the second, so whatever that took from a vertex next to the open,
+         * the drip line on that edge stays put.
          *
          * Raising has a floor. A porch plank whose far end is deep under the roof and whose near
          * end pokes a hand's width past the eave interpolates from 1 to 0 over its whole length,
@@ -155,21 +202,56 @@ public:
          * clear of the roof - is anchored in the open and keeps its snow. Edges running along an
          * eave do not anchor: their whole length is close to cover.
          *
-         * @param positions World space vertex positions
-         * @param normals World space vertex normals, one per position, or empty for a mesh
-         *        without them (every vertex is then read as lying on a flat surface)
-         * @param indices The mesh's triangle list; empty skips the second and third steps
-         * @param fade World units under cover over which openness falls to 0
+         * All three trade a vertex's own openness for a better line across the triangles around
+         * it, which is the right trade only where those triangles are all there is to carry the
+         * fade. Where ShelterRefinement has been, they are not: the vertices it tested and the
+         * ones it added sit where the fade bends, each with the openness of its own spot, and two
+         * shapes that meet - one piece of a walkway and the next - agree along the seam because
+         * both read the same field. Those vertices are measured, and no step moves them; what is
+         * left to settle on such a shape is what was too narrow or too small to test, and the
+         * vertices whose normals are bent away from the faces around them: read along a tilt
+         * those faces do not have, their own openness is no measurement of what the faces show.
+         *
+         * @param indices The mesh's triangle list; empty does nothing
+         * @param fade How openness falls off under cover on the mesh's material
          * @param edgeOpenness Openness at which snow visibly ends on the mesh's material
-         * @param openness Out: one value per position
-         * @return bool Whether any vertex is under cover
+         * @param measured Per vertex, whether its openness is to stand as it is (from
+         *        ShelterRefinement::refine); empty for a mesh none of whose vertices are
+         * @param openness In: one value per position; out: settled
          */
-        [[nodiscard]] auto measureOpenness(std::span<const RE::NiPoint3> positions,
-                                           std::span<const RE::NiPoint3> normals,
-                                           std::span<const std::uint16_t> indices,
-                                           float fade,
-                                           float edgeOpenness,
-                                           std::vector<float>& openness) const -> bool;
+        void settleOpenness(std::span<const RE::NiPoint3> positions,
+                            std::span<const std::uint16_t> indices,
+                            const Fade& fade,
+                            float edgeOpenness,
+                            const std::vector<bool>& measured,
+                            std::vector<float>& openness) const;
+
+        /**
+         * @brief Openness (1 in the open .. 0 deep under cover) of one world space point
+         *
+         * @param slope The tilt of the surface the point lies on
+         * @param fade How openness falls off under cover
+         */
+        [[nodiscard]] auto opennessAt(const RE::NiPoint3& point,
+                                      const Slope& slope,
+                                      const Fade& fade) const -> float;
+
+        /**
+         * @brief Whether any column over a world space rectangle tops out above a height, at a glance
+         *
+         * A cheap look before an expensive one: a shape none of whose vertices is under cover may
+         * still have a roof edge crossing the middle of a triangle, and whether that is even
+         * possible is a matter of scanning the lattice over the shape's footprint, which is far
+         * cheaper than probing the inside of every triangle to find out.
+         *
+         * @param lowZ The lowest point of what stands in the rectangle; a column counts from the
+         *        clearance above it
+         */
+        [[nodiscard]] auto anyCoverOver(float minX,
+                                        float minY,
+                                        float maxX,
+                                        float maxY,
+                                        float lowZ) const -> bool;
 
     private:
         /**
@@ -261,7 +343,7 @@ public:
     /**
      * @brief Counts a shape's snow-holding vertices by what cover does to them
      *
-     * @param openness Per vertex openness, from Field::measureOpenness
+     * @param openness Per vertex openness, from Field::initialOpenness and settleOpenness
      * @param facing Per vertex dot(normal, up)
      * @param holdsSnowFrom The facing from which a vertex can hold snow at all
      * @param edgeOpenness Openness at which snow visibly ends

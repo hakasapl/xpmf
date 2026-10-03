@@ -127,6 +127,17 @@ auto ShelterMap::Slope::ofTriangle(const RE::NiPoint3& first,
     return of(unit.z < 0.0F ? -unit : unit);
 }
 
+auto ShelterMap::Fade::of(float distance,
+                          float edgeOpenness) -> Fade
+{
+    // What the plain falloff is at the depth the edge is to lie at, raised to the power, is the
+    // edge value. Kept off 0 and 1, where no power gets it there
+    constexpr float MIN_EDGE = 0.01F;
+    const float plain = 1.0F - (K_EDGE_DEPTH * K_EDGE_DEPTH * (3.0F - (2.0F * K_EDGE_DEPTH)));
+    const float edge = std::clamp(edgeOpenness, MIN_EDGE, 1.0F - MIN_EDGE);
+    return {.distance = distance, .power = std::log(edge) / std::log(plain)};
+}
+
 auto ShelterMap::Field::topAt(int nodeX,
                               int nodeY) const -> float
 {
@@ -283,35 +294,72 @@ auto ShelterMap::Field::distanceToCover(const RE::NiPoint3& point,
     return std::max(std::sqrt(nearestSq) - HALF_SPACING, 0.0F);
 }
 
-auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
-                                        std::span<const RE::NiPoint3> normals,
-                                        std::span<const std::uint16_t> indices,
-                                        float fade,
-                                        float edgeOpenness,
-                                        std::vector<float>& openness) const -> bool
+auto ShelterMap::Field::opennessAt(const RE::NiPoint3& point,
+                                   const Slope& slope,
+                                   const Fade& fade) const -> float
 {
     // The fade, plus the spacing depthUnderCover's estimate gives up: a point deep under cover has
     // to be able to reach 0, or nothing ever counts as covered
-    const float reach = fade + K_SPACING;
-    const auto opennessAt = [&](const RE::NiPoint3& point, const Slope& slope) -> float {
-        const float depth = depthUnderCover(point, slope, reach);
-        if (depth <= 0.0F) {
-            return 1.0F;
-        }
-        const float t = fade > 0.0F ? std::clamp(depth / fade, 0.0F, 1.0F) : 1.0F;
-        return 1.0F - (t * t * (3.0F - (2.0F * t)));
-    };
+    const float depth = depthUnderCover(point, slope, fade.distance + K_SPACING);
+    if (depth <= 0.0F) {
+        return 1.0F;
+    }
+    // A smooth step down over the distance, bent to the material (Fade)
+    const float t = fade.distance > 0.0F ? std::clamp(depth / fade.distance, 0.0F, 1.0F) : 1.0F;
+    return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), fade.power);
+}
 
-    // First step: every vertex's own spot, read along its own surface
+auto ShelterMap::Field::anyCoverOver(float minX,
+                                     float minY,
+                                     float maxX,
+                                     float maxY,
+                                     float lowZ) const -> bool
+{
+    // The nodes whose columns pass over the rectangle, clipped to what the field knows about
+    const int fieldWest = (centerX - 1) * K_CELLS;
+    const int fieldSouth = (centerY - 1) * K_CELLS;
+    const int nodeWest = std::max(static_cast<int>(std::floor(minX / K_SPACING)), fieldWest);
+    const int nodeEast = std::min(static_cast<int>(std::ceil(maxX / K_SPACING)), fieldWest + (K_BLOCK * K_CELLS));
+    const int nodeSouth = std::max(static_cast<int>(std::floor(minY / K_SPACING)), fieldSouth);
+    const int nodeNorth = std::min(static_cast<int>(std::ceil(maxY / K_SPACING)), fieldSouth + (K_BLOCK * K_CELLS));
+    const float coveredAbove = lowZ + K_CLEARANCE;
+    for (int nodeY = nodeSouth; nodeY <= nodeNorth; ++nodeY) {
+        for (int nodeX = nodeWest; nodeX <= nodeEast; ++nodeX) {
+            if (topAt(nodeX, nodeY) > coveredAbove) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+auto ShelterMap::Field::initialOpenness(std::span<const RE::NiPoint3> positions,
+                                        std::span<const RE::NiPoint3> normals,
+                                        const Fade& fade,
+                                        std::vector<float>& openness) const -> bool
+{
     openness.assign(positions.size(), 1.0F);
     bool anyCover = false;
     for (std::size_t index = 0; index < positions.size(); ++index) {
-        openness[index] = opennessAt(positions[index], index < normals.size() ? Slope::of(normals[index]) : Slope {});
+        openness[index]
+            = opennessAt(positions[index], index < normals.size() ? Slope::of(normals[index]) : Slope {}, fade);
         anyCover = anyCover || openness[index] < 1.0F;
     }
-    if (!anyCover || indices.empty()) {
-        return anyCover;
+    return anyCover;
+}
+
+void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
+                                       std::span<const std::uint16_t> indices,
+                                       const Fade& fade,
+                                       float edgeOpenness,
+                                       const std::vector<bool>& measured,
+                                       std::vector<float>& openness) const
+{
+    if (indices.empty() || openness.size() != positions.size()) {
+        return;
     }
+    const auto opennessAt
+        = [&](const RE::NiPoint3& point, const Slope& slope) -> float { return this->opennessAt(point, slope, fade); };
 
     // Which vertices are in the open is decided now: those are never lowered, and they are the ends
     // the third step measures from
@@ -319,6 +367,10 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
     for (std::size_t index = 0; index < positions.size(); ++index) {
         isOpen[index] = openness[index] >= 1.0F;
     }
+    // ...and which stand as they are: the ones ShelterRefinement measured. Every step below reads
+    // them and none writes them
+    const auto stands = [&](std::size_t vertex) -> bool { return vertex < measured.size() && measured[vertex]; };
+    const auto movable = [&](std::size_t vertex) -> bool { return !isOpen[vertex] && !stands(vertex); };
     const auto isTriangle = [&](const std::array<std::size_t, 3>& triangle) -> bool {
         return triangle[0] < positions.size() && triangle[1] < positions.size() && triangle[2] < positions.size();
     };
@@ -327,13 +379,14 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
     // interpolate to more openness than a probe in the middle has, the covered corners are lowered
     // just enough to close the gap, the excess spread over them in proportion to their weight at
     // the probe; a corner ends at the lowest value any probe asks of it. Open corners are never
-    // touched: a triangle that is mostly in the open keeps its snow there.
+    // touched: a triangle that is mostly in the open keeps its snow there. Neither are measured
+    // ones, and a triangle with no other kind is not looked at.
     constexpr std::array<std::array<float, 3>, 4> PROBES {
         {{1.0F / 3.0F, 1.0F / 3.0F, 1.0F / 3.0F}, {0.5F, 0.5F, 0.0F}, {0.0F, 0.5F, 0.5F}, {0.5F, 0.0F, 0.5F}}};
     std::vector<float> lowered(openness);
     for (std::size_t corner = 0; corner + 2 < indices.size(); corner += 3) {
         const std::array<std::size_t, 3> triangle {indices[corner], indices[corner + 1], indices[corner + 2]};
-        if (!isTriangle(triangle) || (isOpen[triangle[0]] && isOpen[triangle[1]] && isOpen[triangle[2]])) {
+        if (!isTriangle(triangle) || std::ranges::none_of(triangle, movable)) {
             continue;
         }
         const RE::NiPoint3& first = positions[triangle[0]];
@@ -346,7 +399,7 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
             for (std::size_t k = 0; k < triangle.size(); ++k) {
                 const std::size_t vertex = triangle.at(k);
                 interpolated += weights.at(k) * openness[vertex];
-                coveredWeight += isOpen[vertex] ? 0.0F : weights.at(k);
+                coveredWeight += movable(vertex) ? weights.at(k) : 0.0F;
             }
             if (interpolated <= 0.0F || coveredWeight <= 0.0F) {
                 continue; // nothing left to lower, or nothing here that may be
@@ -358,7 +411,7 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
             }
             const float cut = excess / coveredWeight;
             for (const std::size_t vertex : triangle) {
-                if (!isOpen[vertex]) {
+                if (movable(vertex)) {
                     lowered[vertex] = std::min(lowered[vertex], std::max(openness[vertex] - cut, 0.0F));
                 }
             }
@@ -400,9 +453,12 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
         // Interpolated openness runs from 1 at the open end to the covered vertex's value; it has
         // to pass edgeOpenness at the target fraction, which fixes that value
         constexpr float MIN_TARGET = 0.05F;
-        const float target = std::clamp(inTheOpen(open, covered, slope) + (0.5F * fade / length), MIN_TARGET, 1.0F);
+        const float target
+            = std::clamp(inTheOpen(open, covered, slope) + (K_EDGE_DEPTH * fade.distance / length), MIN_TARGET, 1.0F);
         const float needed = 1.0F - ((1.0F - edgeOpenness) / target);
-        openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));
+        if (!stands(covered)) {
+            openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));
+        }
         if (needed < 0.0F) {
             overruns.push_back({.open = open, .covered = covered, .target = target});
         }
@@ -416,14 +472,15 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
         const Slope slope = Slope::ofTriangle(positions[triangle[0]], positions[triangle[1]], positions[triangle[2]]);
         for (const std::size_t covered : triangle) {
             for (const std::size_t open : triangle) {
-                if (!isOpen[covered] && isOpen[open]) {
+                // ...unless both ends are measured: there is nothing on that edge to move
+                if (!isOpen[covered] && isOpen[open] && !(stands(covered) && stands(open))) {
                     localize(covered, open, slope);
                 }
             }
         }
     }
     if (overruns.empty()) {
-        return true;
+        return;
     }
 
     // Fourth step: an edge the third could not settle has one value left to move, the open end's.
@@ -434,11 +491,11 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
     // and keeps its snow, whatever a long edge under a roof asks of it; an edge running along an
     // eave anchors nothing, its whole length being close to cover. An edge whose covered end is
     // itself above edgeOpenness is snowy to that end and beyond the open end's reach.
-    const float dripLineReach = std::max(0.5F * fade, K_SPACING);
+    const float dripLineReach = std::max(0.5F * fade.distance, K_SPACING);
     std::vector<float> wanted(positions.size(), 1.0F); // the lowest value any overrun asks of an open vertex
     for (const auto& overrun : overruns) {
         const float coveredEnd = openness[overrun.covered];
-        if (coveredEnd >= edgeOpenness) {
+        if (coveredEnd >= edgeOpenness || stands(overrun.open)) {
             continue;
         }
         const float value = (edgeOpenness - (coveredEnd * overrun.target)) / (1.0F - overrun.target);
@@ -487,7 +544,6 @@ auto ShelterMap::Field::measureOpenness(std::span<const RE::NiPoint3> positions,
             openness[index] = std::min(openness[index], wanted[index]);
         }
     }
-    return true;
 }
 
 auto ShelterMap::tally(std::span<const float> openness,
