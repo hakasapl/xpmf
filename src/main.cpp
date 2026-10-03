@@ -1,4 +1,5 @@
 #include "ConfigLoader.hpp"
+#include "IniSettings.hpp"
 #include "MaterialMatcher.hpp"
 #include "ProjectedGeometry.hpp"
 #include "ProjectedTextures.hpp"
@@ -87,6 +88,10 @@ SKSEPluginInfo(.Version = REL::Version {PLUGIN_VERSION_MAJOR,
             // (kPostLoad), whose winter snow they have to see on the clone
             ProjectedGeometry::install();
         } else if (message->type == SKSE::MessagingInterface::kDataLoaded) {
+            // The two display settings the projection depends on go in first, whatever the INI
+            // files say: MaterialMatcher reads one of them
+            IniSettings::onDataLoaded();
+
             // Material objects exist once every plugin has been parsed, and po3's Tweaks - whose
             // EditorID cache tells them apart - is certain to be loaded by then; well before the
             // first cell attaches

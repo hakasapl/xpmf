@@ -39,6 +39,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 set(headers
     "include/ConfigLoader.hpp"
     "include/EditorIdLookup.hpp"
+    "include/IniSettings.hpp"
     "include/MaterialClassifier.hpp"
     "include/MaterialMatcher.hpp"
     "include/Offsets.hpp"
@@ -58,6 +59,7 @@ set(headers
 set(sources
     "src/ConfigLoader.cpp"
     "src/EditorIdLookup.cpp"
+    "src/IniSettings.cpp"
     "src/main.cpp"
     "src/MaterialClassifier.cpp"
     "src/MaterialMatcher.cpp"

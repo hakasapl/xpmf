@@ -61,10 +61,11 @@ namespace XPMF {
  * was, textures included. A profile that names no diffuse leaves the color as the record has it,
  * marked; its other textures still go with the draws.
  *
- * Two fallbacks. With bEnableProjecteUVDiffuseNormals off the shader samples no diffuse and uses
- * the color as is, so a material gets mean(its texture) - still tagged, since the coverage noise
- * is sampled regardless and the profile's may go with the draws. And should the texture not load
- * as a renderer texture, there is nothing to tag: the game's average is divided out of the color
+ * Two fallbacks. With bEnableProjecteUVDiffuseNormals off (which IniSettings rules out: it turns
+ * the setting on right before this class runs) the shader samples no diffuse and uses the color
+ * as is, so a material gets mean(its texture) - still tagged, since the coverage noise is sampled
+ * regardless and the profile's may go with the draws. And should the texture not load as a
+ * renderer texture, there is nothing to tag: the game's average is divided out of the color
  * instead, color = mean(texture) / mean(ProjectedDiffuse), and the game's textures stay.
  *
  * Tiling goes with the coverage: the shader derives the projected diffuse's coordinates from the
