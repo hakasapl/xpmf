@@ -10,6 +10,8 @@
     "pbr": false,
     "diffuseTexture": "textures/dlc02/landscape/volcanic_ash_01.dds",
     "normalTexture": "textures/dlc02/landscape/volcanic_ash_01_n.dds",
+    "lodMaterial": "AshLODMaterialMtns1P",
+    "lodMaterialHD": "AshMaterialSolstheimMtns1P",
     "neutralizeVertexColors": true,
     "neutralizeVertexAlpha": true,
     "roofShelter": true,

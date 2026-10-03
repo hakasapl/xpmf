@@ -49,7 +49,7 @@ public:
      * @brief One profile: which material objects, and what is done for them
      *
      * The settings fall into the plugin's three independent parts - patching the material (the
-     * four textures, the three falloff values and maxAngle, each applied when given),
+     * four textures, the three falloff values, maxAngle and the LOD materials, each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
      * shelterFade and roofShelterFixVertices) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
@@ -93,6 +93,14 @@ public:
                                           dot(normal, up) above cos(angle) before the noise has its say. 30 to 120
                                           in vanilla (the Creation Kit's "30-90" is a hint: Nordic ruins and word
                                           walls sit at 120); std::nullopt = each static's own */
+        std::string lodIdentifier; /**< Lower case: what the LOD generator names the object LOD shapes of the
+                                      profile's statics, the way the game's are named objsnow and objash -
+                                      "obj" and the profile's name unless the file says otherwise; the HD
+                                      shapes carry it with HD appended, large references with -LargeRef */
+        std::string lodMaterial; /**< EditorID, lower case, of the material object those shapes are given
+                                    (ProjectedLod); empty = none, the game's own objsnow and objash apart */
+        std::string lodMaterialHD; /**< Same for the HD shapes (full textures, the nearest level); empty = the
+                                      plain one */
 
         bool neutralizeVertexColors {}; /**< Whether shapes that carry the projection get white vertex colors */
         std::vector<std::string> neutralizeVertexColorsSkip; /**< Lower case wildcard patterns (* and ?) over the
@@ -194,6 +202,11 @@ public:
     [[nodiscard]] static auto isAnyRoofSheltered() -> bool;
 
     /**
+     * @brief Whether any profile names a LOD material, i.e. whether the object LOD hook is needed
+     */
+    [[nodiscard]] static auto isAnyLodMaterialNamed() -> bool;
+
+    /**
      * @brief Turns whatever the user wrote for a texture into a resource system path
      *
      * @param raw UTF-8; any slashes, any case, with or without Data\ / textures\ / .dds
@@ -201,6 +214,13 @@ public:
      *         .dds; empty for a blank value
      */
     [[nodiscard]] static auto normalizeTexturePath(std::string_view raw) -> std::string;
+
+    /**
+     * @brief What a profile's object LOD shapes are named when the file does not say: "obj" and
+     * the profile's name, lower case, spaces dropped - objsnow and objash for the shipped ones,
+     * which is what the game names its own
+     */
+    [[nodiscard]] static auto defaultLodIdentifier(std::string_view name) -> std::string;
 
 private:
     //
@@ -220,6 +240,10 @@ private:
                              also in splash, trash and wash, and "*ashmaterial*" still in SplashMaterial */
     constexpr static const char* DEFAULT_ASH_PATTERN_DLC = "dlc2ashmaterial*"; /**< DLC2AshMaterialDusting1P */
     constexpr static const char* DEFAULT_ASH_PATTERN_LOD = "ashlodmaterial*"; /**< AshLODMaterialMtns1P */
+    constexpr static const char* DEFAULT_SNOW_LOD_MATERIAL = "snowlodmaterial"; /**< What the game gives objsnow... */
+    constexpr static const char* DEFAULT_SNOW_LOD_MATERIAL_HD = "snowlodmaterialhd"; /**< ...and objsnowHD */
+    constexpr static const char* DEFAULT_ASH_LOD_MATERIAL = "ashlodmaterialmtns1p"; /**< objash... */
+    constexpr static const char* DEFAULT_ASH_LOD_MATERIAL_HD = "ashmaterialsolstheimmtns1p"; /**< ...and objashHD */
 
     // What a profile that leaves a setting out gets: the shipped snow profile's values
     constexpr static bool DEFAULT_PBR = false;

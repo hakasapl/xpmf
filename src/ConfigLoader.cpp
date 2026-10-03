@@ -410,6 +410,14 @@ void ConfigLoader::loadConfig()
             // The static's angle, the fourth value the single pass path reads: written into the
             // statics themselves (MaterialMatcher)
             profile.maxAngle = fields.optionalNumberBetween("maxAngle", 0.0, MAX_ANGLE_LIMIT);
+            // What the profile's object LOD shapes are named, and the material objects they are
+            // given (ProjectedLod)
+            profile.lodIdentifier = Text::toLower(toGameCodePage(fields.optionalString("lodIdentifier")));
+            if (profile.lodIdentifier.empty()) {
+                profile.lodIdentifier = defaultLodIdentifier(profile.name);
+            }
+            profile.lodMaterial = Text::toLower(toGameCodePage(fields.optionalString("lodMaterial")));
+            profile.lodMaterialHD = Text::toLower(toGameCodePage(fields.optionalString("lodMaterialHD")));
             // The three geometry settings, each with the statics it is not applied to
             const auto patterns = [&](const char* key) -> std::vector<std::string> {
                 std::vector<std::string> lowered;
@@ -458,6 +466,12 @@ void ConfigLoader::loadConfig()
                  profile.neutralizeVertexAlpha,
                  profile.neutralizeVertexAlphaSkip);
             idle("roofShelterSkip", "roofShelter", profile.roofShelter, profile.roofShelterSkip);
+            if (profile.lodMaterial.empty() && !profile.lodMaterialHD.empty()) {
+                spdlog::warn("{}: \"lodMaterialHD\" names a material object, but \"lodMaterial\" is not given, so it "
+                             "does nothing",
+                             path.filename().string());
+                profile.lodMaterialHD.clear();
+            }
 
             s_profiles.push_back(std::move(profile));
         }
@@ -504,6 +518,16 @@ void ConfigLoader::loadConfig()
         spdlog::info("Config Loaded: [{}] Falloff Bias: {}", profile.name, orRecord(profile.falloffBias));
         spdlog::info("Config Loaded: [{}] Noise UV Scale: {}", profile.name, orRecord(profile.noiseUVScale));
         spdlog::info("Config Loaded: [{}] Max Angle: {}", profile.name, orRecord(profile.maxAngle));
+        spdlog::info("Config Loaded: [{}] LOD Identifier: {} (HD shapes {}HD)",
+                     profile.name,
+                     profile.lodIdentifier,
+                     profile.lodIdentifier);
+        spdlog::info("Config Loaded: [{}] LOD Material: {}",
+                     profile.name,
+                     profile.lodMaterial.empty() ? "(none)" : profile.lodMaterial.c_str());
+        spdlog::info("Config Loaded: [{}] LOD Material HD: {}",
+                     profile.name,
+                     profile.lodMaterialHD.empty() ? "(the LOD material)" : profile.lodMaterialHD.c_str());
         spdlog::info("Config Loaded: [{}] Neutralize Vertex Colors: {}", profile.name, profile.neutralizeVertexColors);
         spdlog::info("Config Loaded: [{}] Neutralize Vertex Colors Skip: {}",
                      profile.name,
@@ -546,6 +570,11 @@ auto ConfigLoader::isAnySpecularChanged() -> bool
 
 auto ConfigLoader::isAnyRoofSheltered() -> bool { return std::ranges::any_of(s_profiles, &Profile::roofShelter); }
 
+auto ConfigLoader::isAnyLodMaterialNamed() -> bool
+{
+    return std::ranges::any_of(s_profiles, [](const Profile& profile) -> bool { return !profile.lodMaterial.empty(); });
+}
+
 auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
 {
     // What the shipped snow.json and ash.json say; the PBR ones need PBR textures, so they are
@@ -556,6 +585,9 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     snow.pbr = DEFAULT_PBR;
     snow.diffuseTexture = DEFAULT_SNOW_DIFFUSE;
     snow.normalTexture = DEFAULT_SNOW_NORMAL;
+    snow.lodIdentifier = defaultLodIdentifier(snow.name);
+    snow.lodMaterial = DEFAULT_SNOW_LOD_MATERIAL;
+    snow.lodMaterialHD = DEFAULT_SNOW_LOD_MATERIAL_HD;
     snow.neutralizeVertexColors = DEFAULT_NEUTRALIZE_VERTEX_COLORS;
     snow.neutralizeVertexAlpha = DEFAULT_NEUTRALIZE_VERTEX_ALPHA;
     snow.roofShelter = DEFAULT_ROOF_SHELTER;
@@ -568,8 +600,22 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     ash.editorIds = {DEFAULT_ASH_PATTERN_MATERIAL, DEFAULT_ASH_PATTERN_DLC, DEFAULT_ASH_PATTERN_LOD};
     ash.diffuseTexture = DEFAULT_ASH_DIFFUSE;
     ash.normalTexture = DEFAULT_ASH_NORMAL;
+    ash.lodIdentifier = defaultLodIdentifier(ash.name);
+    ash.lodMaterial = DEFAULT_ASH_LOD_MATERIAL;
+    ash.lodMaterialHD = DEFAULT_ASH_LOD_MATERIAL_HD;
 
     return {std::move(ash), std::move(snow)}; // the order of their file names
+}
+
+auto ConfigLoader::defaultLodIdentifier(std::string_view name) -> std::string
+{
+    std::string identifier = "obj";
+    for (const char character : Text::toLower(name)) {
+        if (character != ' ') {
+            identifier += character;
+        }
+    }
+    return identifier;
 }
 
 auto ConfigLoader::normalizeTexturePath(std::string_view raw) -> std::string

@@ -72,6 +72,21 @@
             "default": null,
             "description": "The max angle, in degrees, written into every static that carries one of the profile's patched material objects: the projection needs a surface to face up by more than the cosine of it before the noise has its say. Vanilla statics use 30 to 120 (the Creation Kit's \"30-90\" is only a hint; Nordic ruins and word walls sit at 120). null or absent = each static's own."
         },
+        "lodIdentifier": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "What the LOD generator names the object LOD shapes of the profile's statics, the way the game's own are named objSnow and objAsh: this name for the shapes with LOD textures, this name with HD appended for the ones the generator gives full textures (the nearest level), either with -LargeRef appended on the shapes of large references. Case does not matter. null or absent = \"obj\" and the profile's name (objMoss for a profile named moss). objSnow and objAsh are the game's own and are left to it."
+        },
+        "lodMaterial": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "EditorID of the material object the shapes carrying the profile's lodIdentifier are given in object LOD, the way the game gives its objSnow shapes SnowLODMaterial. The record is the profile's own whatever the patterns say, and wants its own falloff and noise UV scale tuned for distance (SnowLODMaterial uses a noise UV scale of 1500 where SnowMaterialObject1P uses 48); DynDOLOD, reading the profile, names the shapes it builds for the profile's statics with the identifier once a profile has this. null or absent = the profile's statics get no projection in object LOD beyond what the game does for snow and ash on its own."
+        },
+        "lodMaterialHD": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "The same for the HD shapes (full textures, the nearest level), the way SnowLODMaterialHD serves objSnowHD; which shapes are HD and the vertex alpha intensity on them are the generator's call. Does nothing without lodMaterial. null or absent = the HD shapes get lodMaterial as well."
+        },
         "neutralizeVertexColors": {
             "type": "boolean",
             "default": true,

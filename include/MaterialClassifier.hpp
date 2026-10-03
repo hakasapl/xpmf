@@ -72,6 +72,7 @@ public:
      */
     enum class Reason : std::uint8_t {
         EDITOR_ID, /**< The profile's pattern matched */
+        LOD_MATERIAL, /**< Named as a profile's LOD material (lodMaterial, lodMaterialHD), which beats any pattern */
         EXCLUDED, /**< A profile's patterns matched, but so did one of its exclusions, and no other profile took it */
         NOT_PBR, /**< A profile's patterns matched, but it is a pbr profile and True PBR has no configuration for the
                     material, and no other profile took it */
