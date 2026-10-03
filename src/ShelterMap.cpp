@@ -309,12 +309,11 @@ auto ShelterMap::Field::opennessAt(const RE::NiPoint3& point,
     return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), fade.power);
 }
 
-auto ShelterMap::Field::overhead(float minX,
-                                 float minY,
-                                 float maxX,
-                                 float maxY,
-                                 float lowZ,
-                                 float highZ) const -> Overhead
+auto ShelterMap::Field::anyCoverOver(float minX,
+                                     float minY,
+                                     float maxX,
+                                     float maxY,
+                                     float lowZ) const -> bool
 {
     // The nodes whose columns pass over the rectangle, clipped to what the field knows about
     const int fieldWest = (centerX - 1) * K_CELLS;
@@ -323,18 +322,15 @@ auto ShelterMap::Field::overhead(float minX,
     const int nodeEast = std::min(static_cast<int>(std::ceil(maxX / K_SPACING)), fieldWest + (K_BLOCK * K_CELLS));
     const int nodeSouth = std::max(static_cast<int>(std::floor(minY / K_SPACING)), fieldSouth);
     const int nodeNorth = std::min(static_cast<int>(std::ceil(maxY / K_SPACING)), fieldSouth + (K_BLOCK * K_CELLS));
-
-    Overhead result;
     const float coveredAbove = lowZ + K_CLEARANCE;
-    const float openBelow = highZ + K_CLEARANCE;
-    for (int nodeY = nodeSouth; nodeY <= nodeNorth && !(result.anyCovered && result.anyOpen); ++nodeY) {
+    for (int nodeY = nodeSouth; nodeY <= nodeNorth; ++nodeY) {
         for (int nodeX = nodeWest; nodeX <= nodeEast; ++nodeX) {
-            const float top = topAt(nodeX, nodeY);
-            result.anyCovered = result.anyCovered || top > coveredAbove;
-            result.anyOpen = result.anyOpen || top <= openBelow;
+            if (topAt(nodeX, nodeY) > coveredAbove) {
+                return true;
+            }
         }
     }
-    return result;
+    return false;
 }
 
 auto ShelterMap::Field::initialOpenness(std::span<const RE::NiPoint3> positions,

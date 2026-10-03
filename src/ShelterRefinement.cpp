@@ -31,7 +31,6 @@ constexpr float K_KEY_SCALE = 8.0F; /**< Points are told apart to an eighth of a
                                        one mesh agree to far better than that, and nothing that close is ever
                                        meant to be apart */
 constexpr std::uint32_t K_NONE = std::numeric_limits<std::uint32_t>::max();
-constexpr int K_ROUNDS_CAP = 8; /**< Rounds of splitting, whatever the limits say */
 constexpr std::size_t K_MAX_VERTICES = std::numeric_limits<std::uint16_t>::max(); /**< What a BSTriShape counts to */
 constexpr float K_CREASE = 0.9F; /**< Cosine of the angle between the planes of two triangles past which the edge
                                     they share is a crease - the rim of a plank, the corner of a beam - and one
@@ -191,11 +190,10 @@ public:
         }
         findBroadSurfaces();
 
-        const int rounds = std::min(m_limits.maxRounds, K_ROUNDS_CAP);
         std::size_t added = 0;
         std::size_t alive = m_triangles.size();
         bool anySplit = false;
-        for (int round = 0; round < rounds; ++round) {
+        for (int round = 0; round < m_limits.maxRounds; ++round) {
             m_marks.clear();
             m_seen.clear();
             for (std::size_t index = 0; index < m_triangles.size(); ++index) {
@@ -266,6 +264,15 @@ private:
         }
         return std::ranges::any_of(corners,
                                    [&](std::uint32_t index) -> bool { return m_normals[index].z >= m_holdsSnowFrom; });
+    }
+
+    /**
+     * @brief Whether an edge is long enough to split: each half at least the shortest allowed
+     */
+    [[nodiscard]] auto splittable(float length) const -> bool
+    {
+        constexpr float HALVES = 2.0F;
+        return length >= HALVES * m_limits.minEdge;
     }
 
     /**
@@ -735,7 +742,7 @@ private:
                     const std::uint32_t from = triangle.corner[edge];
                     const std::uint32_t to = triangle.corner[(edge + 1) % 3];
                     const float length = (m_positions[from] - m_positions[to]).Length();
-                    if (triangle.cut[edge] || length < 2.0F * m_limits.minEdge) {
+                    if (triangle.cut[edge] || !splittable(length)) {
                         continue;
                     }
                     const bool marked = m_marks.contains(edgeKeyOf(from, to));
@@ -799,19 +806,13 @@ private:
         const RE::NiPoint3& a = m_positions[corner[0]];
         const RE::NiPoint3& b = m_positions[corner[1]];
         const RE::NiPoint3& c = m_positions[corner[2]];
-        float longest = 0.0F;
-        std::size_t longestEdge = 0;
-        for (std::size_t edge = 0; edge < 3; ++edge) {
-            const float length = (m_positions[corner[edge]] - m_positions[corner[(edge + 1) % 3]]).Length();
-            if (length > longest) {
-                longest = length;
-                longestEdge = edge;
-            }
-        }
+        const std::array<float, 3> length {(b - a).Length(), (c - b).Length(), (a - c).Length()};
+        const auto longestEdge
+            = static_cast<std::size_t>(std::distance(length.begin(), std::ranges::max_element(length)));
         // Too short to split, or too narrow to show anything, unless the surface goes on to
         // either side of it: a sliver of a fan is as wide as the floor the fan is cut from
         const bool sliver = isSliver(corner);
-        if (longest < 2.0F * m_limits.minEdge || (sliver && !triangle.broad)) {
+        if (!splittable(length.at(longestEdge)) || (sliver && !triangle.broad)) {
             return;
         }
         // Tested, whatever comes of it: its corners' openness is the measured one from here on,
@@ -838,16 +839,15 @@ private:
             }
             const std::uint32_t from = corner[edge];
             const std::uint32_t to = corner[(edge + 1) % 3];
-            const float length = (m_positions[from] - m_positions[to]).Length();
             const EdgeKey key = edgeKeyOf(from, to);
             if (m_marks.contains(key)) {
                 anyMarked = true;
                 continue;
             }
-            if (!m_seen.insert(key).second || length < 2.0F * m_limits.minEdge) {
+            if (!m_seen.insert(key).second || !splittable(length.at(edge))) {
                 continue; // already found straight enough this round, or too short to split
             }
-            if (const Mark worst = worstSample(from, to, length); worst.deviation > m_limits.tolerance) {
+            if (const Mark worst = worstSample(from, to, length.at(edge)); worst.deviation > m_limits.tolerance) {
                 m_marks.emplace(key, worst);
                 anyMarked = true;
             }

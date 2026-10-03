@@ -237,29 +237,21 @@ public:
                                       const Fade& fade) const -> float;
 
         /**
-         * @brief What the columns over a world space rectangle hold, at a glance
+         * @brief Whether any column over a world space rectangle tops out above a height, at a glance
          *
          * A cheap look before an expensive one: a shape none of whose vertices is under cover may
-         * still have a roof edge crossing the middle of a triangle, and one all of whose vertices
-         * are may have a skylight over the middle of one; whether either is even possible is a
-         * matter of scanning the lattice over the shape's footprint, which is far cheaper than
-         * probing the inside of every triangle to find out.
+         * still have a roof edge crossing the middle of a triangle, and whether that is even
+         * possible is a matter of scanning the lattice over the shape's footprint, which is far
+         * cheaper than probing the inside of every triangle to find out.
+         *
+         * @param lowZ The lowest point of what stands in the rectangle; a column counts from the
+         *        clearance above it
          */
-        struct Overhead {
-            bool anyCovered {}; /**< Some column tops out above lowZ plus the clearance: something may shelter */
-            bool anyOpen {}; /**< Some column tops out at or below highZ plus the clearance, or is empty */
-        };
-
-        /**
-         * @param lowZ The lowest point of what stands in the rectangle
-         * @param highZ Its highest point
-         */
-        [[nodiscard]] auto overhead(float minX,
-                                    float minY,
-                                    float maxX,
-                                    float maxY,
-                                    float lowZ,
-                                    float highZ) const -> Overhead;
+        [[nodiscard]] auto anyCoverOver(float minX,
+                                        float minY,
+                                        float maxX,
+                                        float maxY,
+                                        float lowZ) const -> bool;
 
     private:
         /**

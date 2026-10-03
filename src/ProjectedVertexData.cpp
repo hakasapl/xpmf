@@ -304,10 +304,10 @@ auto ProjectedVertexData::customRefined(const Shape& shape,
                                         const ShelterRefinement::Result& refinement,
                                         std::span<const std::uint8_t> values) -> Data*
 {
+    // The rest - the vertex count, the triangle list, what the added vertices blend - build() checks
     const std::size_t vertices = static_cast<std::size_t>(shape.vertexCount) + refinement.added.size();
     const std::size_t triangles = refinement.indices.size() / 3;
-    if (shape.source == nullptr || refinement.added.empty() || values.size() != vertices || vertices > K_MAX_COUNT
-        || triangles == 0 || triangles > K_MAX_COUNT || refinement.indices.size() % 3 != 0) {
+    if (shape.source == nullptr || refinement.added.empty() || values.size() != vertices || triangles > K_MAX_COUNT) {
         return nullptr;
     }
     {
@@ -456,7 +456,7 @@ void ProjectedVertexData::install(RE::BSTriShape& shape,
     auto& triShape = shape.GetTrishapeRuntimeData();
     const bool shrinking = wanted.has_value()
         && (wanted->vertices < triShape.vertexCount || wanted->triangles < triShape.triangleCount);
-    if (wanted.has_value() && shrinking) {
+    if (shrinking) {
         triShape.vertexCount = wanted->vertices;
         triShape.triangleCount = wanted->triangles;
     }

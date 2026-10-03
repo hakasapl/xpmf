@@ -1756,16 +1756,16 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
                 bool worthALook = anyCover;
                 if (!worthALook) {
                     RE::NiPoint3 low = positions.front();
-                    RE::NiPoint3 high = positions.front();
+                    float maxX = low.x;
+                    float maxY = low.y;
                     for (const auto& position : positions) {
                         low.x = std::min(low.x, position.x);
                         low.y = std::min(low.y, position.y);
                         low.z = std::min(low.z, position.z);
-                        high.x = std::max(high.x, position.x);
-                        high.y = std::max(high.y, position.y);
-                        high.z = std::max(high.z, position.z);
+                        maxX = std::max(maxX, position.x);
+                        maxY = std::max(maxY, position.y);
                     }
-                    worthALook = job.field.overhead(low.x, low.y, high.x, high.y, low.z, high.z).anyCovered;
+                    worthALook = job.field.anyCoverOver(low.x, low.y, maxX, maxY, low.z);
                 }
                 if (worthALook) {
                     modelPositions.resize(vertexCount);
