@@ -82,7 +82,7 @@ namespace XPMF {
  * also keeps its own scale, bias and noise scale unless the profile gives one (falloffScale,
  * falloffBias, noiseUVScale: the three of the record's values the single pass path reads, so the
  * only three there is anything to override), so nothing gains or loses cover that the profile did
- * not ask for; only the color (and the snow flag, where the profile says so) changes. The fourth
+ * not ask for; only the color changes (the snow flag stays as the record has it). The fourth
  * value the path reads, the max angle, is the static's rather than the material's (its DNAM), so
  * a profile's maxAngle is written into the statics that carry its patched materials instead.
  *

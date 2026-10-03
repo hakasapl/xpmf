@@ -144,8 +144,8 @@ void MaterialMatcher::onDataLoaded()
         // and the projected textures like vanilla's does), as does every one of a profile that
         // patches nothing - but the shapes under either still carry a projection, which is what
         // the vertex color and roof shelter parts work on.
-        // Whether the profile has anything for the records at all: a texture, the Snow flag, a
-        // falloff value or a max angle
+        // Whether the profile has anything for the records at all: a texture, a falloff value or
+        // a max angle
         const bool patches = profile.patchesMaterial();
         std::vector<const Candidate*> ours;
         std::vector<const Candidate*> untouched;
@@ -186,8 +186,6 @@ void MaterialMatcher::onDataLoaded()
         for (const auto* const candidate : ours) {
             auto* const material = candidate->material;
             auto& data = material->directionalData;
-            using Flag = RE::BSMaterialObject::DIRECTIONAL_DATA::Flag;
-            const bool isSnow = profile.isSnow.value_or(data.flags.any(Flag::kSnow));
 
             // The color: the profile's where its diffuse supplies the look, the record's own
             // where the game's diffuse stays - tagged either way when there is a set of textures
@@ -197,15 +195,13 @@ void MaterialMatcher::onDataLoaded()
             if (match->set.has_value()) {
                 color = ProjectedTextures::tag(*match->set, color);
             }
-            spdlog::info("{}: ({:.4f}, {:.4f}, {:.4f}) -> {}, snow {}",
+            spdlog::info("{}: ({:.4f}, {:.4f}, {:.4f}) -> {}",
                          describeForm(*material, candidate->editorId),
                          before.red,
                          before.green,
                          before.blue,
-                         match->color.has_value() ? "the profile's color" : "its own color, tagged",
-                         isSnow ? "on" : "off");
+                         match->color.has_value() ? "the profile's color" : "its own color, tagged");
             data.singlePassColor = color;
-            data.flags = isSnow ? Flag::kSnow : Flag::kNone;
 
             // Scale, bias and noise scale: the profile's where it gives one, the material's own
             // where not - which keeps its coverage what it was. The noise scale takes the

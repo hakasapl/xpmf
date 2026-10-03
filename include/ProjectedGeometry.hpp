@@ -40,8 +40,9 @@ namespace XPMF {
  * neutralizeVertexAlphaSkip, roofShelterSkip: a mesh whose colors or mask are wanted as they
  * are, a porch that is to stay snowed under its roof), see settingsOf. A fourth setting, specularMult,
  * scales the specular strength of the shapes the projection is on, since the shader lights a
- * covered pixel with the mesh's own specular unless the material carries the Snow flag - on the
- * game's own materials only: Community Shaders' PBR materials keep their roughness scale in that
+ * covered pixel with the mesh's own specular, the improved snow pass that would swap in a rim
+ * light being held off (IniSettings) - on the game's own materials only: Community Shaders' PBR
+ * materials keep their roughness scale in that
  * field, and their projected snow takes roughness and specular from CS's material object
  * configuration instead (scaleSpecular). "Snow" below stands for any of them.
  *

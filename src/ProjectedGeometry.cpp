@@ -771,9 +771,9 @@ void ProjectedGeometry::apply(const Swap& swap)
 
     // The engine set these in Clone3D for every lit shape of a static with such a material -
     // Projected_UV always, Snow where the material has the snow flag. A shape judged sheltered
-    // loses them again, one that comes back into the open regains what it had: on a shape without
-    // the projection the Snow flag alone would still switch the improved snow shading on, and ash
-    // never had it.
+    // loses them again, one that comes back into the open regains what it had, so that the
+    // property stays as the engine left it (the Snow flag alone would switch the improved snow
+    // shading on, were IniSettings not holding that off).
     if (shader->flags.any(ShaderFlag::kProjectedUV) != projected) {
         shader->SetFlags(Flag8::kProjectedUV, projected);
         shader->SetFlags(Flag8::kSnow, projected && swap.isSnow);

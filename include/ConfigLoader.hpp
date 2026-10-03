@@ -32,7 +32,7 @@ namespace XPMF {
  * Everything is read once at plugin load (loadConfig) into statics; the getters are plain
  * accessors and never touch the disk. Only "name" and "editorIds" have to be there; every other
  * setting has a default - the shipped snow profile's, except that a texture not named is not
- * replaced and a Snow flag or a falloff value not given is the record's - so a profile can be
+ * replaced and a falloff value not given is the record's - so a profile can be
  * three lines long. What is there is validated strictly: a field has to have its type (and its
  * range), and a file with any problem at all is rejected as a whole, with every reason in one
  * error in the log - half a profile is not something anyone asked for. Keys that are not settings
@@ -49,7 +49,7 @@ public:
      * @brief One profile: which material objects, and what is done for them
      *
      * The settings fall into the plugin's three independent parts - patching the material (the
-     * four textures, isSnow, the three falloff values and maxAngle, each applied when given),
+     * four textures, the three falloff values and maxAngle, each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
      * shelterFade and roofShelterFixVertices) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
@@ -72,8 +72,6 @@ public:
         std::string noiseTexture; /**< Same for the coverage noise; empty = the game's ProjectedNoise stays */
         std::string detailNormalTexture; /**< Same for the detail normal; empty = the game's ProjectedNormalDetail
                                             stays */
-        std::optional<bool> isSnow; /**< The material objects' Snow flag; std::nullopt (null in the file, or the
-                                       key left out) = as the record has it */
 
         // The three of a material object's values the engine's single pass path reads besides the
         // color and the Snow flag (see MaterialMatcher); the projection covers a pixel where
@@ -120,10 +118,10 @@ public:
         float shelterFade {}; /**< World units over which it fades out under cover */
         std::optional<float> specularMult; /**< What the specular strength of every shape the projection is on
                                               is multiplied by, on a copy of the shape's material: 0 takes the
-                                              highlight off, 1 leaves it. Without the Snow flag the shader lights
-                                              covered pixels with the mesh's own specular, which is how a glossy
-                                              mesh makes glossy snow; with the flag it swaps in the snow rim
-                                              light instead (bEnableSnowRimLighting). Not applied to Community
+                                              highlight off, 1 leaves it. The shader lights covered pixels with
+                                              the mesh's own specular, which is how a glossy mesh makes glossy
+                                              snow (the snow rim light that would replace it belongs to the
+                                              improved snow pass, which IniSettings holds off). Not applied to Community
                                               Shaders' PBR materials, whose roughness scale lives in that field.
                                               std::nullopt = as the mesh has it */
 
@@ -147,7 +145,7 @@ public:
         [[nodiscard]] auto patchesMaterial() const -> bool
         {
             return !diffuseTexture.empty() || !normalTexture.empty() || !noiseTexture.empty()
-                || !detailNormalTexture.empty() || isSnow.has_value() || overridesFalloff() || maxAngle.has_value();
+                || !detailNormalTexture.empty() || overridesFalloff() || maxAngle.has_value();
         }
     };
 

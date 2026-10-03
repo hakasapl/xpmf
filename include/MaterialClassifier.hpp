@@ -25,8 +25,10 @@ namespace XPMF {
  *    holds) leaves the constructor's 0 in place, and so DLC2SnowMaterialLakeSurface - real
  *    snow - loads without it, as does any material from a plugin converted from Skyrim LE.
  *    To the engine the flag is a shading hint and nothing more: Clone3D forwards it as
- *    "isSnow", which sets the Snow shader flag (SLSF2 bit 28) next to Projected_UV and turns on
- *    the SSE snow specular / sparkle for the projected part.
+ *    "isSnow", which sets the Snow shader flag (SLSF2 bit 28) next to Projected_UV, and that
+ *    flag only ever puts a shape through the improved snow technique (rim light, sparkle, the
+ *    subsurface pass), which IniSettings holds off; with it off the flag changes nothing but
+ *    the distance an env map fades at.
  *
  *  - The model (MODL). Only the Creation Kit opens it. At runtime a MATO's shader properties
  *    are deserialized from its DNAM blobs, and the single pass snow, ash and moss materials all

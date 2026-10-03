@@ -152,21 +152,6 @@ public:
     }
 
     /**
-     * @brief true, false, or "no opinion" for null or a key left out
-     */
-    [[nodiscard]] auto optionalBoolean(const char* key) -> std::optional<bool>
-    {
-        const auto* const value = find(key, false);
-        if (value == nullptr || value->is_null()) {
-            return std::nullopt;
-        }
-        if (!value->is_boolean()) {
-            return wrong<std::optional<bool>>(key, "true, false, null, or left out");
-        }
-        return value->get<bool>();
-    }
-
-    /**
      * @brief A number in range; fallback when the key is left out or null
      */
     [[nodiscard]] auto number(const char* key,
@@ -417,7 +402,6 @@ void ConfigLoader::loadConfig()
             profile.normalTexture = normalizeTexturePath(fields.optionalString("normalTexture"));
             profile.noiseTexture = normalizeTexturePath(fields.optionalString("noiseTexture"));
             profile.detailNormalTexture = normalizeTexturePath(fields.optionalString("detailNormalTexture"));
-            profile.isSnow = fields.optionalBoolean("isSnow");
             // The record's own falloff values unless the profile gives one; the engine divides by
             // the noise UV scale
             profile.falloffScale = fields.optionalNumber("falloffScale");
@@ -516,11 +500,6 @@ void ConfigLoader::loadConfig()
         spdlog::info("Config Loaded: [{}] Noise Texture: {}", profile.name, orGame(profile.noiseTexture));
         spdlog::info(
             "Config Loaded: [{}] Detail Normal Texture: {}", profile.name, orGame(profile.detailNormalTexture));
-        spdlog::info("Config Loaded: [{}] Is Snow: {}",
-                     profile.name,
-                     !profile.isSnow.has_value() ? "(as the record has it)"
-                         : *profile.isSnow       ? "true"
-                                                 : "false");
         spdlog::info("Config Loaded: [{}] Falloff Scale: {}", profile.name, orRecord(profile.falloffScale));
         spdlog::info("Config Loaded: [{}] Falloff Bias: {}", profile.name, orRecord(profile.falloffBias));
         spdlog::info("Config Loaded: [{}] Noise UV Scale: {}", profile.name, orRecord(profile.noiseUVScale));
@@ -577,21 +556,18 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     snow.pbr = DEFAULT_PBR;
     snow.diffuseTexture = DEFAULT_SNOW_DIFFUSE;
     snow.normalTexture = DEFAULT_SNOW_NORMAL;
-    snow.isSnow = true;
     snow.neutralizeVertexColors = DEFAULT_NEUTRALIZE_VERTEX_COLORS;
     snow.neutralizeVertexAlpha = DEFAULT_NEUTRALIZE_VERTEX_ALPHA;
     snow.roofShelter = DEFAULT_ROOF_SHELTER;
     snow.roofShelterFixVertices = DEFAULT_ROOF_SHELTER_FIX_VERTICES;
     snow.shelterFade = DEFAULT_SHELTER_FADE;
 
-    // Ash falls like snow and lies like snow, so it gets everything snow gets - except the snow
-    // shading, which is sparkle and rim light
+    // Ash falls like snow and lies like snow, so it gets everything snow gets
     Profile ash = snow;
     ash.name = "ash";
     ash.editorIds = {DEFAULT_ASH_PATTERN_MATERIAL, DEFAULT_ASH_PATTERN_DLC, DEFAULT_ASH_PATTERN_LOD};
     ash.diffuseTexture = DEFAULT_ASH_DIFFUSE;
     ash.normalTexture = DEFAULT_ASH_NORMAL;
-    ash.isSnow = false;
 
     return {std::move(ash), std::move(snow)}; // the order of their file names
 }
