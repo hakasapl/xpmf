@@ -112,6 +112,7 @@ struct Triangle {
     bool holds {}; /**< Has a corner that can hold snow, so its interpolation shows */
     bool broad {}; /**< Lies on a snow holding surface wide enough to show a wrong interpolation, however narrow
                       the triangle itself: a sliver of the fan a floor is cut into (findBroadSurfaces) */
+    std::uint32_t origin {}; /**< The model's triangle it descends from (Result::origins) */
 };
 
 /**
@@ -178,7 +179,8 @@ public:
             Triangle triangle {.corner = {indices[at], indices[at + 1], indices[at + 2]},
                                .round = 0,
                                .alive = true,
-                               .holds = false};
+                               .holds = false,
+                               .origin = static_cast<std::uint32_t>(m_triangles.size())};
             const bool valid = std::ranges::all_of(triangle.corner,
                                                    [&](std::uint32_t index) -> bool { return index < m_sourceCount; });
             triangle.holds = valid && holdsSnow(triangle.corner);
@@ -245,11 +247,13 @@ public:
         ShelterRefinement::Result result;
         result.added = std::move(m_added);
         result.indices.reserve(alive * 3);
+        result.origins.reserve(alive);
         for (const Triangle& triangle : m_triangles) {
             if (triangle.alive) {
                 for (const std::uint32_t index : triangle.corner) {
                     result.indices.push_back(static_cast<std::uint16_t>(index));
                 }
+                result.origins.push_back(triangle.origin);
             }
         }
         result.probes = m_probes;
@@ -665,7 +669,8 @@ private:
                                            .round = round,
                                            .alive = true,
                                            .holds = holdsSnow(corners),
-                                           .broad = one.broad});
+                                           .broad = one.broad,
+                                           .origin = one.origin});
                 };
                 piece({apex, from, across}, one.cut[(here.edge + 2) % 3], other.cut[(there.edge + 1) % 3]);
                 piece({across, to, apex}, other.cut[(there.edge + 2) % 3], one.cut[(here.edge + 1) % 3]);
@@ -1044,7 +1049,8 @@ private:
                                    .round = round,
                                    .alive = true,
                                    .holds = holdsSnow(corners),
-                                   .broad = parent.broad});
+                                   .broad = parent.broad,
+                                   .origin = parent.origin});
         };
         if (marked == 1) {
             child({v[0], m[0], v[2]}, {was[0], made, was[2]});

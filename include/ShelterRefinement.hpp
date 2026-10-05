@@ -89,6 +89,9 @@ public:
     struct Result {
         std::vector<Vertex> added; /**< Appended after the model's vertices, in index order */
         std::vector<std::uint16_t> indices; /**< The whole refined triangle list */
+        std::vector<std::uint32_t> origins; /**< Per triangle of indices, the model's triangle it was cut from - itself
+                                               where it was left whole - by which a twin shape drawing the same
+                                               triangles is cut alike (ShelterTwins) */
         std::size_t probes {}; /**< Field lookups spent, for the log */
     };
 

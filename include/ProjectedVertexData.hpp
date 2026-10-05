@@ -91,7 +91,8 @@ public:
                                     (keepAlpha) */
         bool fixVertices {}; /**< roofShelterFixVertices: a shape partly under cover may be given the vertices its
                                 cover needs (ShelterRefinement); with shelter, and never on one that keeps its
-                                alpha or draws a LOD prefix of its triangles */
+                                alpha or draws a LOD prefix of its triangles. A shape drawing the triangles of
+                                a refined one is cut the same way whatever this says (ShelterTwins) */
 
         auto operator==(const Shape&) const -> bool = default;
     };
@@ -126,18 +127,31 @@ public:
                                      std::span<const std::uint8_t> values) -> Data*;
 
     /**
+     * @brief What a refined variant's colors are made of
+     */
+    enum class Colors {
+        kProjected, /**< As for the shape's projection: white where the profile neutralizes colors, the alpha reset
+                       where it neutralizes alpha (and the shape does not keep its own), then scaled by the values */
+        kModel /**< The model's own colors and alpha, for a twin whose projection is switched off: it draws the
+                  refined triangles with the shading the mesh was given */
+    };
+
+    /**
      * @brief Builds a private variant with the shelter in its alpha and the vertices ShelterRefinement
      * added, on the refined triangle list
      *
      * @param refinement The added vertices and the triangle list, from ShelterRefinement::refine
+     *        or ShelterTwins::replay
      * @param values As for custom(), one per vertex of the refined shape: the model's first, the
-     *        added ones after them
+     *        added ones after them; empty leaves the alpha as the colors start it (a twin that
+     *        only has to share the topology)
      * @return Data* New data carrying one reference for the caller, never the source; nullptr as
      *         for custom(), or when the refined shape would exceed what a BSTriShape counts
      */
     [[nodiscard]] static auto customRefined(const Shape& shape,
                                             const ShelterRefinement::Result& refinement,
-                                            std::span<const std::uint8_t> values) -> Data*;
+                                            std::span<const std::uint8_t> values,
+                                            Colors colors = Colors::kProjected) -> Data*;
 
     /**
      * @brief Resolves renderer data to the model's original: itself, unless it is a variant
@@ -174,10 +188,11 @@ public:
     [[nodiscard]] static auto fingerprint(std::span<const std::uint8_t> values) -> std::uint64_t;
 
     /**
-     * @brief Fingerprint customRefined() would store for these values on this refinement
+     * @brief Fingerprint customRefined() would store for these values on this refinement, made of these colors
      */
     [[nodiscard]] static auto fingerprintRefined(std::span<const std::uint8_t> values,
-                                                 const ShelterRefinement::Result& refinement) -> std::uint64_t;
+                                                 const ShelterRefinement::Result& refinement,
+                                                 Colors colors = Colors::kProjected) -> std::uint64_t;
 
     /**
      * @brief One more reference on renderer data (the engine's own count)

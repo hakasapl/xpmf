@@ -51,6 +51,7 @@ set(headers
     "include/SeasonsOfSkyrim.hpp"
     "include/ShelterMap.hpp"
     "include/ShelterRefinement.hpp"
+    "include/ShelterTwins.hpp"
     "include/Text.hpp"
     "include/TextureColor.hpp"
     "include/VertexLayout.hpp"
@@ -70,6 +71,7 @@ set(sources
     "src/SeasonsOfSkyrim.cpp"
     "src/ShelterMap.cpp"
     "src/ShelterRefinement.cpp"
+    "src/ShelterTwins.cpp"
     "src/TextureColor.cpp"
 )
 

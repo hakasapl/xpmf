@@ -77,7 +77,8 @@ namespace XPMF {
  *    second pass following them; every later one waits for the whole neighborhood. In the open ->
  *    keeps the shared variant, partly covered -> a private variant whose alpha fades with the
  *    distance under cover (and, with the profile's roofShelterFixVertices, with the vertices
- *    ShelterRefinement adds where the mesh is too coarse to carry that fade), sheltered -> its
+ *    ShelterRefinement adds where the mesh is too coarse to carry that fade, cut into every
+ *    shape of the model drawing the same triangles as well, see ShelterTwins), sheltered -> its
  *    projected snow is switched off (the Projected_UV
  *    and Snow shader flags the engine set in Clone3D are cleared again) and it goes back to the
  *    model's own vertex data - and onto a list (s_switchedOff), since the next gather has to take
@@ -243,6 +244,10 @@ private:
         bool alphaTest {}; /**< The shape is alpha tested (ShapeView::alphaTest): its threshold follows its alpha */
         std::uint8_t alphaThreshold {}; /**< ...the mesh's threshold, and */
         std::uint8_t currentAlphaThreshold {}; /**< ...the one the shape has now */
+        RE::FormID reference {}; /**< The reference the shape belongs to: the shapes of one reference that draw the
+                                    same triangles are cut alike (ShelterTwins) */
+        bool decal {}; /**< Decal or Dynamic_Decal shader flag: drawn with a depth bias, so a twin of nothing */
+        bool plainTriShape {}; /**< ShapeView::refinable: a triangle list that may be traded for another */
 
         /**
          * @brief Whether two records say the same of one shape: where it stands, what it was given to
@@ -598,6 +603,76 @@ private:
     [[nodiscard]] static auto run(ReceiverJob& job) -> ReceiverResult;
 
     /**
+     * @brief Scratch vectors a receiver pass reuses from shape to shape; worker thread
+     */
+    struct Scratch {
+        std::vector<RE::NiPoint3> positions; /**< World space: the model's vertices, then any added */
+        std::vector<RE::NiPoint3> modelPositions;
+        std::vector<RE::NiPoint3> normals;
+        std::vector<float> openness;
+        std::vector<bool> measured; /**< Per vertex, whether the vertex fix has its openness in hand */
+        std::vector<float> facing;
+        std::vector<std::uint8_t> values; /**< Per vertex, what the mesh's alpha is scaled by, or becomes */
+    };
+
+    /**
+     * @brief What a refined shape hands the twins that draw its triangles (ShelterTwins)
+     */
+    struct Lead {
+        std::optional<ShelterRefinement::Result> refinement; /**< The topology it draws, when a refined one */
+        std::vector<RE::NiPoint3> modelPositions; /**< Its model's vertices */
+        std::span<const std::uint16_t> indices; /**< Its model's triangle list, in the pinned source data */
+        std::vector<bool> measured; /**< Per vertex, the model's then the added: whether the openness stands as
+                                       measured (ShelterRefinement) */
+    };
+
+    /**
+     * @brief The worker's verdict on one receiver, before anything is done about it
+     */
+    struct Judgement {
+        bool keep {}; /**< The shape keeps what it draws */
+        Data* wanted {}; /**< Otherwise what it is to draw, carrying a reference; nullptr when nothing could be built */
+        bool projected {true};
+        std::uint8_t alphaThreshold {};
+        bool unmet {}; /**< ReceiverResult::unmet */
+        bool twinFailed {}; /**< A twin could not be given the topology it has to share: the budget, or pieces that
+                               do not fit it */
+    };
+
+    /**
+     * @brief Shapes of one reference that draw the same triangles: one leads, the rest are cut like it
+     */
+    struct TwinGroup {
+        std::size_t leader {}; /**< Index into the job's receivers: the refinable shape with the most triangles */
+        std::vector<std::size_t> followers;
+        bool held {}; /**< A follower cannot be cut like the leader (a mesh LOD shape, another transform below
+                         the root): the leader is not refined either */
+    };
+
+    /**
+     * @brief The twin groups among a job's receivers (ShelterTwins::groups per reference, less the
+     * decal flagged shapes), where one of a group could be refined at all; worker thread
+     */
+    [[nodiscard]] static auto twinGroups(const std::vector<Receiver>& receivers) -> std::vector<TwinGroup>;
+
+    /**
+     * @brief Judges one receiver against the field: what it is to draw
+     *
+     * @param mayRefine Whether the vertex fix may be applied to it (its profile's say, and not held
+     *        back for a twin's sake); false for a twin, which is cut like its leader instead
+     * @param lead The refined shape it is a twin of, whose topology it is to share; nullptr for a
+     *        shape on its own, or one whose leader draws the model's triangles
+     * @param leading Out, when not nullptr: what this shape hands its twins; empty unless it draws a
+     *        refined topology
+     */
+    [[nodiscard]] static auto judge(const ShelterMap::Field& field,
+                                    const Receiver& receiver,
+                                    Scratch& scratch,
+                                    bool mayRefine,
+                                    const Lead* lead,
+                                    Lead* leading) -> Judgement;
+
+    /**
      * @brief The world space positions of a receiver's vertices
      *
      * @param positions Out: one per vertex of the model's shape
@@ -669,6 +744,10 @@ private:
     static inline std::atomic<std::size_t> s_refinedVertices {0}; /**< Vertices they added in all */
     static inline std::atomic<std::size_t> s_refinedTriangles {0}; /**< Triangles they added in all */
     static inline std::atomic<std::size_t> s_refinedProbes {0}; /**< Field lookups the refinement spent in all */
+    static inline std::atomic<std::size_t> s_replayedBuilds {0}; /**< Refined variants built for twins, cut like the
+                                                                   shape they draw the triangles of (ShelterTwins) */
+    static inline std::atomic<std::size_t> s_twinsHeld {0}; /**< Refinements not made because a twin could not be
+                                                              cut alike */
     static inline std::size_t s_loggedRefinedBuilds = 0; /**< s_refinedBuilds as of the last log line; main thread */
 
     // What the cell pass has done, for the same log line; main thread only
