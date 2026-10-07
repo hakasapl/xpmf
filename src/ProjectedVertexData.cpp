@@ -302,12 +302,14 @@ auto ProjectedVertexData::custom(const Shape& shape,
 
 auto ProjectedVertexData::customRefined(const Shape& shape,
                                         const ShelterRefinement::Result& refinement,
-                                        std::span<const std::uint8_t> values) -> Data*
+                                        std::span<const std::uint8_t> values,
+                                        Colors colors) -> Data*
 {
     // The rest - the vertex count, the triangle list, what the added vertices blend - build() checks
     const std::size_t vertices = static_cast<std::size_t>(shape.vertexCount) + refinement.added.size();
     const std::size_t triangles = refinement.indices.size() / 3;
-    if (shape.source == nullptr || refinement.added.empty() || values.size() != vertices || triangles > K_MAX_COUNT) {
+    if (shape.source == nullptr || refinement.added.empty() || (!values.empty() && values.size() != vertices)
+        || triangles > K_MAX_COUNT) {
         return nullptr;
     }
     {
@@ -317,10 +319,17 @@ auto ProjectedVertexData::customRefined(const Shape& shape,
         }
     }
 
+    // Colors the shader never showed may hold anything, so a variant (which turns them on) starts
+    // them white and opaque whatever else is asked; a shape that keeps its alpha keeps it here too
     Recipe recipe;
-    recipe.whiten = !shape.colorsEnabled || shape.neutralize;
-    recipe.resetAlpha = !shape.colorsEnabled || shape.neutralizeAlpha;
-    recipe.values = values;
+    if (colors == Colors::kModel) {
+        recipe.whiten = false;
+        recipe.resetAlpha = !shape.colorsEnabled;
+    } else {
+        recipe.whiten = !shape.colorsEnabled || shape.neutralize;
+        recipe.resetAlpha = !shape.colorsEnabled || (shape.neutralizeAlpha && !shape.keepAlpha);
+        recipe.values = values;
+    }
     recipe.refinement = &refinement;
     Data* const variant = build(shape, recipe);
     if (variant == nullptr || variant == shape.source) {
@@ -336,7 +345,7 @@ auto ProjectedVertexData::customRefined(const Shape& shape,
     s_variants.emplace(variant,
                        Entry {.source = shape.source,
                               .bytes = bytes,
-                              .fingerprint = fingerprintRefined(values, refinement),
+                              .fingerprint = fingerprintRefined(values, refinement, colors),
                               .colorless = !shape.colorsEnabled,
                               .refined = true,
                               .counts = {.vertices = static_cast<std::uint16_t>(vertices),
@@ -396,12 +405,14 @@ auto ProjectedVertexData::fingerprint(std::span<const std::uint8_t> values) -> s
 }
 
 auto ProjectedVertexData::fingerprintRefined(std::span<const std::uint8_t> values,
-                                             const ShelterRefinement::Result& refinement) -> std::uint64_t
+                                             const ShelterRefinement::Result& refinement,
+                                             Colors colors) -> std::uint64_t
 {
     constexpr std::uint64_t OFFSET_BASIS = 0xCBF29CE484222325ULL;
     constexpr std::uint64_t REFINED_SALT = 0x51F15ED0000ULL; /**< So that values on the model's topology and the
                                                                 same values on a refined one never agree */
-    std::uint64_t hash = hashBytes(values, OFFSET_BASIS ^ REFINED_SALT);
+    constexpr std::uint64_t MODEL_SALT = 0x0DE1C0105ULL; /**< ...nor the model's colors with the projection's */
+    std::uint64_t hash = hashBytes(values, OFFSET_BASIS ^ REFINED_SALT ^ (colors == Colors::kModel ? MODEL_SALT : 0));
     const std::span<const std::uint8_t> indexBytes {
         reinterpret_cast<const std::uint8_t*>(refinement.indices.data()), // NOLINT: bytes of a trivial array
         refinement.indices.size() * sizeof(std::uint16_t)};

@@ -4,7 +4,7 @@ set(VCPKG_TARGET_TRIPLET "x64-windows-static")
 
 set(PLUGIN_NAME "XPMF")
 set(PLUGIN_DESCRIPTION "Extended Projected Materials Framework")
-set(PLUGIN_VERSION "0.7.0")
+set(PLUGIN_VERSION "0.7.1")
 project(${PLUGIN_NAME} VERSION ${PLUGIN_VERSION} DESCRIPTION "${PLUGIN_DESCRIPTION}" LANGUAGES CXX)
 
 if(MSVC)
@@ -52,6 +52,7 @@ set(headers
     "include/SeasonsOfSkyrim.hpp"
     "include/ShelterMap.hpp"
     "include/ShelterRefinement.hpp"
+    "include/ShelterTwins.hpp"
     "include/Text.hpp"
     "include/TextureColor.hpp"
     "include/VertexLayout.hpp"
@@ -72,6 +73,7 @@ set(sources
     "src/SeasonsOfSkyrim.cpp"
     "src/ShelterMap.cpp"
     "src/ShelterRefinement.cpp"
+    "src/ShelterTwins.cpp"
     "src/TextureColor.cpp"
 )
 

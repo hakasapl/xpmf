@@ -7,6 +7,7 @@
 #include "SeasonsOfSkyrim.hpp"
 #include "ShelterMap.hpp"
 #include "ShelterRefinement.hpp"
+#include "ShelterTwins.hpp"
 #include "Text.hpp"
 #include "VertexLayout.hpp"
 
@@ -889,12 +890,16 @@ void ProjectedGeometry::slice()
 
         if (const auto builds = s_refinedBuilds.load(std::memory_order_relaxed); builds != s_loggedRefinedBuilds) {
             spdlog::info("Roof shelter vertex fix: {} refined vertex buffers built so far, adding {} vertices and {} "
-                         "triangles in all over {} field probes. Cell pass: {} gathers, {} of them finding nothing "
+                         "triangles in all over {} field probes; {} twin shapes cut like the shape they copy, {} "
+                         "refinements held back for a twin that could not be. Cell pass: {} gathers, {} of them "
+                         "finding nothing "
                          "new; {} receiver passes; {} of {} height layers came back as they were",
                          builds,
                          s_refinedVertices.load(std::memory_order_relaxed),
                          s_refinedTriangles.load(std::memory_order_relaxed),
                          s_refinedProbes.load(std::memory_order_relaxed),
+                         s_replayedBuilds.load(std::memory_order_relaxed),
+                         s_twinsHeld.load(std::memory_order_relaxed),
                          s_gathers,
                          s_idleGathers,
                          s_receiverPasses,
@@ -1384,8 +1389,10 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
              .alphaTest = shape->alphaTest != nullptr,
              .alphaThreshold
              = shape->alphaTest != nullptr ? originalAlphaThreshold(*shape->alphaTest) : std::uint8_t {0},
-             .currentAlphaThreshold
-             = shape->alphaTest != nullptr ? shape->alphaTest->alphaThreshold : std::uint8_t {0}});
+             .currentAlphaThreshold = shape->alphaTest != nullptr ? shape->alphaTest->alphaThreshold : std::uint8_t {0},
+             .reference = ref.GetFormID(),
+             .decal = shape->shader->flags.any(ShaderFlag::kDecal, ShaderFlag::kDynamicDecal),
+             .plainTriShape = shape->refinable});
     });
 }
 
@@ -1686,218 +1693,548 @@ auto ProjectedGeometry::refinementLimits(std::uint32_t vertexCount) -> ShelterRe
             .maxTriangles = MAX_COUNT};
 }
 
-auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
+namespace {
+
+/**
+ * @brief Whether two shapes stand in one place with one orientation and size: bit for bit, as two
+ * shapes cut from one model's faces do
+ */
+auto sameTransform(const RE::NiTransform& one,
+                   const RE::NiTransform& other) -> bool
+{
+    for (std::size_t row = 0; row < 3; ++row) {
+        for (std::size_t column = 0; column < 3; ++column) {
+            if (one.rotate.entry[row][column] != other.rotate.entry[row][column]) {
+                return false;
+            }
+        }
+    }
+    return one.translate.x == other.translate.x && one.translate.y == other.translate.y
+        && one.translate.z == other.translate.z && one.scale == other.scale;
+}
+
+auto unitOf(const RE::NiPoint3& vector) -> RE::NiPoint3
+{
+    const float length = vector.Length();
+    constexpr float MIN_LENGTH = 1.0e-6F;
+    return length > MIN_LENGTH ? vector * (1.0F / length) : vector;
+}
+
+} // namespace
+
+auto ProjectedGeometry::twinGroups(const std::vector<Receiver>& receivers) -> std::vector<TwinGroup>
+{
+    std::vector<TwinGroup> groups;
+
+    // The shapes of each reference, less the decal flagged ones and those with nothing to read
+    std::unordered_map<RE::FormID, std::vector<std::size_t>> byReference;
+    for (std::size_t index = 0; index < receivers.size(); ++index) {
+        const Receiver& receiver = receivers[index];
+        const Data* const source = receiver.shape.source;
+        if (receiver.decal || source == nullptr || source->rawVertexData == nullptr
+            || source->rawIndexData == nullptr) {
+            continue;
+        }
+        byReference[receiver.reference].push_back(index);
+    }
+
+    std::vector<std::vector<RE::NiPoint3>> positions;
+    std::vector<ShelterTwins::Shape> shapes;
+    for (const auto& [reference, members] : byReference) {
+        // Only where one of them could be refined at all
+        const bool anyLeader = std::ranges::any_of(members, [&](std::size_t index) -> bool {
+            return receivers[index].shape.fixVertices && !receivers[index].shape.keepAlpha;
+        });
+        if (members.size() < 2 || !anyLeader) {
+            continue;
+        }
+        positions.assign(members.size(), {});
+        shapes.clear();
+        for (std::size_t slot = 0; slot < members.size(); ++slot) {
+            const Receiver& receiver = receivers[members[slot]];
+            if (const auto layout = VertexLayout::from(receiver.shape.source->vertexDesc); layout.has_value()) {
+                worldPositions(receiver, *layout, positions[slot]);
+            }
+            shapes.push_back({
+                .positions = positions[slot],
+                .indices
+                = {receiver.shape.source->rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3},
+            });
+        }
+        for (const auto& group : ShelterTwins::groups(shapes)) {
+            // The refinable shape with the most triangles leads; the rest follow, where they can
+            std::size_t leader = group.size();
+            for (const std::size_t slot : group) {
+                const Receiver& receiver = receivers[members[slot]];
+                if (receiver.shape.fixVertices && !receiver.shape.keepAlpha
+                    && (leader == group.size()
+                        || receiver.shape.triangleCount > receivers[members[leader]].shape.triangleCount)) {
+                    leader = slot;
+                }
+            }
+            if (leader == group.size()) {
+                continue; // nothing in it will be refined
+            }
+            TwinGroup twins {.leader = members[leader]};
+            const Receiver& lead = receivers[members[leader]];
+            for (const std::size_t slot : group) {
+                if (slot == leader) {
+                    continue;
+                }
+                const Receiver& receiver = receivers[members[slot]];
+                twins.followers.push_back(members[slot]);
+                if (!receiver.plainTriShape || !sameTransform(receiver.world, lead.world)) {
+                    twins.held = true;
+                }
+            }
+            groups.push_back(std::move(twins));
+        }
+    }
+    return groups;
+}
+
+auto ProjectedGeometry::judge(const ShelterMap::Field& field,
+                              const Receiver& receiver,
+                              Scratch& scratch,
+                              bool mayRefine,
+                              const Lead* lead,
+                              Lead* leading) -> Judgement
 {
     constexpr float FULL = VertexLayout::COLOR_MAX; /**< As a float, for the alpha arithmetic */
     constexpr float MIN_UP = 0.05F; /**< Below this a surface carries no snow, and dividing by it is unwise */
+    using Colors = ProjectedVertexData::Colors;
 
-    ReceiverResult result;
-    result.cell = job.cell;
-    result.epoch = job.epoch;
+    Judgement judgement;
+    if (leading != nullptr) {
+        *leading = Lead {};
+    }
+    const Data& source = *receiver.shape.source;
+    const auto layout = VertexLayout::from(source.vertexDesc);
+    if (!layout.has_value() || source.rawVertexData == nullptr) {
+        judgement.keep = true;
+        return judgement;
+    }
+    const bool shelter = receiver.shape.shelter; // its profile's roofShelter
+    const std::uint32_t vertexCount = receiver.shape.vertexCount;
+    const std::span<const std::uint8_t> vertices {source.rawVertexData,
+                                                  static_cast<std::size_t>(layout->stride) * vertexCount};
+    const auto vertexAt = [&](std::uint32_t index) -> std::span<const std::uint8_t> {
+        return vertices.subspan(static_cast<std::size_t>(index) * layout->stride, layout->stride);
+    };
+    auto& positions = scratch.positions;
+    auto& modelPositions = scratch.modelPositions;
+    auto& normals = scratch.normals;
+    auto& openness = scratch.openness;
+    auto& measured = scratch.measured;
+    auto& facing = scratch.facing;
+    auto& values = scratch.values;
 
-    std::vector<RE::NiPoint3> positions;
-    std::vector<RE::NiPoint3> modelPositions;
-    std::vector<RE::NiPoint3> normals;
-    std::vector<float> openness;
-    std::vector<bool> measured; // per vertex, whether the vertex fix has its openness in hand
-    std::vector<float> facing;
-    std::vector<std::uint8_t> values; // per vertex, what the mesh's alpha is scaled by, or becomes
-    for (auto& receiver : job.receivers) {
-        const Data& source = *receiver.shape.source;
-        const auto layout = VertexLayout::from(source.vertexDesc);
-        if (!layout.has_value() || source.rawVertexData == nullptr) {
-            continue;
+    // World space normals: the rotation alone, a NiTransform scaling uniformly. Their z is how
+    // far up a vertex faces; their tilt is what the shelter map reads its own surface by
+    normals.clear();
+    if (layout->hasNormals) {
+        normals.resize(vertexCount);
+        for (std::uint32_t index = 0; index < vertexCount; ++index) {
+            normals[index] = receiver.world.rotate * layout->normal(vertexAt(index));
         }
-        const bool shelter = receiver.shape.shelter; // its profile's roofShelter
-        const std::uint32_t vertexCount = receiver.shape.vertexCount;
-        const std::span<const std::uint8_t> vertices {source.rawVertexData,
-                                                      static_cast<std::size_t>(layout->stride) * vertexCount};
-        const auto vertexAt = [&](std::uint32_t index) -> std::span<const std::uint8_t> {
-            return vertices.subspan(static_cast<std::size_t>(index) * layout->stride, layout->stride);
-        };
+    }
 
-        // World space normals: the rotation alone, a NiTransform scaling uniformly. Their z is how
-        // far up a vertex faces; their tilt is what the shelter map reads its own surface by
-        normals.clear();
-        if (layout->hasNormals) {
-            normals.resize(vertexCount);
-            for (std::uint32_t index = 0; index < vertexCount; ++index) {
-                normals[index] = receiver.world.rotate * layout->normal(vertexAt(index));
+    // The shelter's alpha value per vertex: 1 in the open and less under cover, which the
+    // alpha the shape starts from - the mesh's own, so that a mask its author painted only
+    // ever loses more, or 1 where the profile neutralizes it - is multiplied by. Alpha only means
+    // something relative to what the shader compares it with: a surface facing up by
+    // `facing`, at an alpha of 1, has just lost its snow at (threshold + K_BLEND_FLOOR) /
+    // facing, so openness 0..1 is mapped onto [that, 1] - the same openness then means the
+    // same amount of snow on a 30 degree walkway (threshold 0.93) as on a 90 degree rock
+    // (0.4), instead of the walkway going bare at the first hint of cover.
+    const auto goneAlpha = [&](float facingValue) -> float {
+        return std::clamp(
+            K_NORMAL_MAP_SAFETY * (receiver.threshold + K_BLEND_FLOOR) / std::max(facingValue, MIN_UP), 0.0F, 1.0F);
+    };
+    // ...and where on that scale snow visibly ends on a flat surface (projection weight 0 at
+    // average noise), which is what the edge localization aims for
+    const float flatGone = goneAlpha(1.0F);
+    constexpr float MIN_SPAN = 0.01F;
+    constexpr float EDGE_MARGIN = 0.05F;
+    const float edgeOpenness
+        = std::clamp((receiver.threshold + (receiver.noiseAmplitude * receiver.meanNoise) - flatGone)
+                         / std::max(1.0F - flatGone, MIN_SPAN),
+                     EDGE_MARGIN,
+                     1.0F - EDGE_MARGIN);
+    // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
+    // that one shelterFade ends the snow as far in on this material as on any other
+    const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
+
+    // A vertex holds snow if it could show any with nothing overhead
+    const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
+
+    // A shape without a CPU index list still gets per vertex values, just no edge placement
+    // and no refinement
+    std::span<const std::uint16_t> indices;
+    if (source.rawIndexData != nullptr) {
+        indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
+    }
+    const std::span<const std::uint16_t> modelIndices = indices;
+
+    auto verdict = ShelterMap::Verdict::OPEN;
+    std::optional<ShelterRefinement::Result> refinement;
+    bool carried = false; // the topology is a refined twin's, to be shared whatever the verdict
+    if (shelter) {
+        worldPositions(receiver, *layout, positions);
+        bool anyCover = field.initialOpenness(positions, normals, fade, openness);
+        measured.clear();
+
+        if (lead != nullptr) {
+            // A twin of a refined shape is cut the way that was, whatever its own cover says
+            // (ShelterTwins): copies of one surface only agree on depth while they are
+            // triangulated alike
+            if (lead->refinement.has_value() && !indices.empty()) {
+                modelPositions.resize(vertexCount);
+                for (std::uint32_t index = 0; index < vertexCount; ++index) {
+                    modelPositions[index] = VertexLayout::position(vertexAt(index));
+                }
+                ShelterTwins::Replayed replayed = ShelterTwins::replay(
+                    *lead->refinement, lead->modelPositions, lead->indices, modelPositions, indices);
+                if (replayed.outcome == ShelterTwins::Outcome::kFailed) {
+                    judgement.twinFailed = true;
+                    return judgement;
+                }
+                if (replayed.outcome == ShelterTwins::Outcome::kCarried) {
+                    refinement = std::move(replayed.result);
+                    carried = true;
+                    // The added vertices as the refinement would have made them: at their spot,
+                    // tilted by this shape's own normals, with the openness read there; measured
+                    // where the refined shape measured the same spot
+                    const std::size_t leaderCount = lead->modelPositions.size();
+                    for (const ShelterRefinement::Vertex& added : refinement->added) {
+                        positions.push_back(receiver.world * added.position);
+                        ShelterMap::Slope slope;
+                        if (layout->hasNormals) {
+                            RE::NiPoint3 normal;
+                            for (std::size_t slot = 0; slot < added.source.size(); ++slot) {
+                                if (added.weight.at(slot) > 0.0F && added.source.at(slot) < normals.size()) {
+                                    normal += normals[added.source.at(slot)] * added.weight.at(slot);
+                                }
+                            }
+                            normal = unitOf(normal);
+                            normals.push_back(normal);
+                            slope = ShelterMap::Slope::of(normal);
+                        }
+                        openness.push_back(field.opennessAt(positions.back(), slope, fade));
+                    }
+                    measured.assign(positions.size(), false);
+                    for (std::uint32_t index = 0; index < vertexCount; ++index) {
+                        const std::uint32_t from = replayed.vertexFrom[index];
+                        measured[index]
+                            = from != ShelterTwins::K_NONE && from < lead->measured.size() && lead->measured[from];
+                    }
+                    for (std::size_t item = 0; item < replayed.addedFrom.size(); ++item) {
+                        const std::size_t from = leaderCount + replayed.addedFrom[item];
+                        measured[vertexCount + item] = from < lead->measured.size() && lead->measured[from];
+                    }
+                    indices = refinement->indices;
+                    anyCover
+                        = anyCover || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
+                }
             }
-        }
-
-        // The shelter's alpha value per vertex: 1 in the open and less under cover, which the
-        // alpha the shape starts from - the mesh's own, so that a mask its author painted only
-        // ever loses more, or 1 where the profile neutralizes it - is multiplied by. Alpha only means
-        // something relative to what the shader compares it with: a surface facing up by
-        // `facing`, at an alpha of 1, has just lost its snow at (threshold + K_BLEND_FLOOR) /
-        // facing, so openness 0..1 is mapped onto [that, 1] - the same openness then means the
-        // same amount of snow on a 30 degree walkway (threshold 0.93) as on a 90 degree rock
-        // (0.4), instead of the walkway going bare at the first hint of cover.
-        const auto goneAlpha = [&](float facing) -> float {
-            return std::clamp(
-                K_NORMAL_MAP_SAFETY * (receiver.threshold + K_BLEND_FLOOR) / std::max(facing, MIN_UP), 0.0F, 1.0F);
-        };
-        // ...and where on that scale snow visibly ends on a flat surface (projection weight 0 at
-        // average noise), which is what the edge localization aims for
-        const float flatGone = goneAlpha(1.0F);
-        constexpr float MIN_SPAN = 0.01F;
-        constexpr float EDGE_MARGIN = 0.05F;
-        const float edgeOpenness
-            = std::clamp((receiver.threshold + (receiver.noiseAmplitude * receiver.meanNoise) - flatGone)
-                             / std::max(1.0F - flatGone, MIN_SPAN),
-                         EDGE_MARGIN,
-                         1.0F - EDGE_MARGIN);
-        // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
-        // that one shelterFade ends the snow as far in on this material as on any other
-        const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
-
-        // A vertex holds snow if it could show any with nothing overhead
-        const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
-
-        // A shape without a CPU index list still gets per vertex values, just no edge placement
-        // and no refinement
-        std::span<const std::uint16_t> indices;
-        if (source.rawIndexData != nullptr) {
-            indices = {source.rawIndexData, static_cast<std::size_t>(receiver.shape.triangleCount) * 3};
-        }
-
-        auto verdict = ShelterMap::Verdict::OPEN;
-        std::optional<ShelterRefinement::Result> refinement;
-        if (shelter) {
-            worldPositions(receiver, *layout, positions);
-            bool anyCover = job.field.initialOpenness(positions, normals, fade, openness);
-
+        } else if (mayRefine && receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
             // The vertex fix, where the profile wants it and the shape can take it: with a vertex
             // under cover there is a fade to follow; without one there may still be a roof edge
             // crossing the middle of a triangle, which is worth a look only if any column over
             // the shape's footprint tops out above it at all
-            measured.clear();
-            if (receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
-                bool worthALook = anyCover;
-                if (!worthALook) {
-                    RE::NiPoint3 low = positions.front();
-                    float maxX = low.x;
-                    float maxY = low.y;
-                    for (const auto& position : positions) {
-                        low.x = std::min(low.x, position.x);
-                        low.y = std::min(low.y, position.y);
-                        low.z = std::min(low.z, position.z);
-                        maxX = std::max(maxX, position.x);
-                        maxY = std::max(maxY, position.y);
-                    }
-                    worthALook = job.field.anyCoverOver(low.x, low.y, maxX, maxY, low.z);
+            bool worthALook = anyCover;
+            if (!worthALook) {
+                RE::NiPoint3 low = positions.front();
+                float maxX = low.x;
+                float maxY = low.y;
+                for (const auto& position : positions) {
+                    low.x = std::min(low.x, position.x);
+                    low.y = std::min(low.y, position.y);
+                    low.z = std::min(low.z, position.z);
+                    maxX = std::max(maxX, position.x);
+                    maxY = std::max(maxY, position.y);
                 }
-                if (worthALook) {
-                    modelPositions.resize(vertexCount);
-                    for (std::uint32_t index = 0; index < vertexCount; ++index) {
-                        modelPositions[index] = VertexLayout::position(vertexAt(index));
-                    }
-                    refinement = ShelterRefinement::refine(job.field,
-                                                           modelPositions,
-                                                           positions,
-                                                           normals,
-                                                           openness,
-                                                           measured,
-                                                           indices,
-                                                           holdsSnowFrom,
-                                                           fade,
-                                                           refinementLimits(vertexCount));
-                    if (refinement.has_value()) {
-                        indices = refinement->indices;
-                        anyCover = anyCover
-                            || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
-                        s_refinedProbes.fetch_add(refinement->probes, std::memory_order_relaxed);
-                    }
-                }
+                worthALook = field.anyCoverOver(low.x, low.y, maxX, maxY, low.z);
             }
-
-            if (anyCover) {
-                // What the vertex fix tested stands as measured: left to the settling, a floor's
-                // rim would be pulled down to mend the middle of triangles that are no longer
-                // there, and a hard edge left along it. The settling is for the rest - what was
-                // too narrow or too small to test, and every shape the fix is not for
-                job.field.settleOpenness(positions, indices, fade, edgeOpenness, measured, openness);
-                facing.resize(positions.size());
-                for (std::size_t index = 0; index < positions.size(); ++index) {
-                    facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
+            if (worthALook) {
+                modelPositions.resize(vertexCount);
+                for (std::uint32_t index = 0; index < vertexCount; ++index) {
+                    modelPositions[index] = VertexLayout::position(vertexAt(index));
                 }
-                verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
-                                            !receiver.shape.keepAlpha);
+                refinement = ShelterRefinement::refine(field,
+                                                       modelPositions,
+                                                       positions,
+                                                       normals,
+                                                       openness,
+                                                       measured,
+                                                       indices,
+                                                       holdsSnowFrom,
+                                                       fade,
+                                                       refinementLimits(vertexCount));
+                if (refinement.has_value()) {
+                    indices = refinement->indices;
+                    anyCover
+                        = anyCover || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
+                    s_refinedProbes.fetch_add(refinement->probes, std::memory_order_relaxed);
+                }
             }
         }
 
-        Data* wanted = nullptr;
-        bool projected = true;
-        std::uint8_t alphaThreshold = receiver.alphaThreshold; // the mesh's, unless a mask lowers the alpha
-        if (verdict == ShelterMap::Verdict::OPEN) {
+        if (anyCover) {
+            // What the vertex fix tested stands as measured: left to the settling, a floor's
+            // rim would be pulled down to mend the middle of triangles that are no longer
+            // there, and a hard edge left along it. The settling is for the rest - what was
+            // too narrow or too small to test, and every shape the fix is not for
+            field.settleOpenness(positions, indices, fade, edgeOpenness, measured, openness);
+            facing.resize(positions.size());
+            for (std::size_t index = 0; index < positions.size(); ++index) {
+                facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
+            }
+            verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
+                                        !receiver.shape.keepAlpha);
+        }
+    }
+
+    // What the shape is to draw. A private variant it already draws, to the same values, stays
+    // (the fingerprint); a refined topology the shape leads with is handed on only once it is
+    // sure to be drawn
+    Data* wanted = nullptr;
+    bool projected = true;
+    std::uint8_t alphaThreshold = receiver.alphaThreshold; // the mesh's, unless a mask lowers the alpha
+    bool drawsRefined = false;
+    const auto keepsCurrent = [&](std::uint64_t fingerprint, bool projectedWanted, std::uint8_t threshold) -> bool {
+        return receiver.projected == projectedWanted && fingerprint == receiver.currentFingerprint
+            && threshold == receiver.currentAlphaThreshold;
+    };
+    if (verdict == ShelterMap::Verdict::OPEN) {
+        if (carried) {
+            if (keepsCurrent(ProjectedVertexData::fingerprintRefined({}, *refinement, Colors::kProjected),
+                             true,
+                             alphaThreshold)) {
+                judgement.keep = true;
+                return judgement;
+            }
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, Colors::kProjected);
+            if (wanted == nullptr) {
+                judgement.twinFailed = true;
+                return judgement;
+            }
+            s_replayedBuilds.fetch_add(1, std::memory_order_relaxed);
+        } else {
             wanted = ProjectedVertexData::shared(receiver.shape);
-        } else if (verdict == ShelterMap::Verdict::SHELTERED) {
-            // No snow, so nothing for vertex colors to tint and nothing for alpha to mask: the
-            // model's own data, baked shading and all
-            projected = false;
+        }
+    } else if (verdict == ShelterMap::Verdict::SHELTERED) {
+        // No snow, so nothing for vertex colors to tint and nothing for alpha to mask: the
+        // model's own data, baked shading and all - on the refined triangles where the shape is
+        // the twin of a refined one
+        projected = false;
+        if (carried) {
+            if (keepsCurrent(
+                    ProjectedVertexData::fingerprintRefined({}, *refinement, Colors::kModel), false, alphaThreshold)) {
+                judgement.keep = true;
+                return judgement;
+            }
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, Colors::kModel);
+            if (wanted == nullptr) {
+                judgement.twinFailed = true;
+                return judgement;
+            }
+            s_replayedBuilds.fetch_add(1, std::memory_order_relaxed);
+        } else {
             ProjectedVertexData::addRef(receiver.shape.source);
             wanted = receiver.shape.source;
-        } else {
-            // One value per vertex of the shape as it will be drawn: the model's, then the added
-            const std::size_t total = openness.size();
-            values.resize(total);
-            for (std::size_t index = 0; index < total; ++index) {
-                const float gone = goneAlpha(facing[index]);
-                values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
-            }
-            if (receiver.alphaTest) {
-                // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
-                alphaThreshold = scaledAlphaThreshold(receiver.alphaThreshold, *std::ranges::min_element(values));
-            }
-            const std::uint64_t fingerprint = refinement.has_value()
-                ? ProjectedVertexData::fingerprintRefined(values, *refinement)
-                : ProjectedVertexData::fingerprint(values);
-            if (receiver.projected && fingerprint == receiver.currentFingerprint
-                && alphaThreshold == receiver.currentAlphaThreshold) {
-                continue; // what it already has
-            }
-            if (refinement.has_value()) {
-                wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values);
-                if (wanted != nullptr) {
-                    s_refinedBuilds.fetch_add(1, std::memory_order_relaxed);
-                    s_refinedVertices.fetch_add(refinement->added.size(), std::memory_order_relaxed);
-                    s_refinedTriangles.fetch_add((refinement->indices.size() / 3) - receiver.shape.triangleCount,
-                                                 std::memory_order_relaxed);
-                } else {
-                    // The refined buffer could not be had (the budget, or a failed creation): the
-                    // mask on the model's own vertices is still the better part of the fix
-                    wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
-                    result.unmet = true;
-                }
-            } else {
-                wanted = ProjectedVertexData::custom(receiver.shape, values);
-            }
-            if (wanted == nullptr) {
-                wanted = ProjectedVertexData::shared(receiver.shape); // over budget
-                alphaThreshold = receiver.alphaThreshold;
-                result.unmet = true;
-            }
         }
+    } else {
+        // One value per vertex of the shape as it will be drawn: the model's, then the added
+        const std::size_t total = openness.size();
+        values.resize(total);
+        for (std::size_t index = 0; index < total; ++index) {
+            const float gone = goneAlpha(facing[index]);
+            values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
+        }
+        if (receiver.alphaTest) {
+            // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
+            alphaThreshold = scaledAlphaThreshold(receiver.alphaThreshold, *std::ranges::min_element(values));
+        }
+        const std::uint64_t fingerprint = refinement.has_value()
+            ? ProjectedVertexData::fingerprintRefined(values, *refinement)
+            : ProjectedVertexData::fingerprint(values);
+        if (keepsCurrent(fingerprint, true, alphaThreshold)) {
+            judgement.keep = true;
+            drawsRefined = refinement.has_value(); // what it already has
+        } else if (refinement.has_value()) {
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values);
+            if (wanted != nullptr) {
+                drawsRefined = true;
+                s_refinedBuilds.fetch_add(1, std::memory_order_relaxed);
+                s_refinedVertices.fetch_add(refinement->added.size(), std::memory_order_relaxed);
+                s_refinedTriangles.fetch_add((refinement->indices.size() / 3) - receiver.shape.triangleCount,
+                                             std::memory_order_relaxed);
+                if (carried) {
+                    s_replayedBuilds.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (carried) {
+                judgement.twinFailed = true;
+                return judgement;
+            } else {
+                // The refined buffer could not be had (the budget, or a failed creation): the
+                // mask on the model's own vertices is still the better part of the fix
+                wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
+                judgement.unmet = true;
+            }
+        } else {
+            wanted = ProjectedVertexData::custom(receiver.shape, values);
+        }
+        if (!judgement.keep && wanted == nullptr) {
+            if (carried) {
+                judgement.twinFailed = true;
+                return judgement;
+            }
+            wanted = ProjectedVertexData::shared(receiver.shape); // over budget
+            alphaThreshold = receiver.alphaThreshold;
+            judgement.unmet = true;
+        }
+    }
 
+    if (!judgement.keep) {
         if (wanted == nullptr) {
-            result.unmet = true;
-            continue; // no vertex data could be built for it
+            judgement.unmet = true; // no vertex data could be built for it
+            return judgement;
         }
         if (wanted == receiver.current && projected == receiver.projected
             && alphaThreshold == receiver.currentAlphaThreshold) {
             ProjectedVertexData::release(wanted);
-            continue; // keeps what it has
+            judgement.keep = true; // keeps what it has
+            return judgement;
         }
-        result.swaps.push_back({.shape = receiver.keepAlive,
-                                .data = wanted,
-                                .projected = projected,
-                                .isSnow = receiver.isSnow,
-                                .alphaThreshold = receiver.alphaTest ? std::optional {alphaThreshold} : std::nullopt});
-        receiver.current = wanted;
-        receiver.projected = projected;
-        receiver.currentFingerprint = ProjectedVertexData::fingerprintOf(wanted);
-        receiver.currentAlphaThreshold = alphaThreshold;
+        judgement.wanted = wanted;
+        judgement.projected = projected;
+        judgement.alphaThreshold = alphaThreshold;
+    }
+    if (leading != nullptr && drawsRefined && !carried) {
+        leading->refinement = std::move(refinement);
+        leading->modelPositions = modelPositions;
+        leading->indices = modelIndices;
+        leading->measured = measured;
+    }
+    return judgement;
+}
+
+auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
+{
+    ReceiverResult result;
+    result.cell = job.cell;
+    result.epoch = job.epoch;
+    Scratch scratch;
+
+    const auto commit = [&](Receiver& receiver, Judgement& judgement) -> void {
+        result.unmet = result.unmet || judgement.unmet;
+        if (judgement.keep) {
+            return;
+        }
+        if (judgement.wanted == nullptr) {
+            result.unmet = true;
+            return;
+        }
+        result.swaps.push_back({
+            .shape = receiver.keepAlive,
+            .data = judgement.wanted,
+            .projected = judgement.projected,
+            .isSnow = receiver.isSnow,
+            .alphaThreshold = receiver.alphaTest ? std::optional {judgement.alphaThreshold} : std::nullopt,
+        });
+        receiver.current = judgement.wanted;
+        receiver.projected = judgement.projected;
+        receiver.currentFingerprint = ProjectedVertexData::fingerprintOf(judgement.wanted);
+        receiver.currentAlphaThreshold = judgement.alphaThreshold;
+    };
+    const auto discard = [](Judgement& judgement) -> void {
+        if (!judgement.keep && judgement.wanted != nullptr) {
+            ProjectedVertexData::release(judgement.wanted);
+        }
+        judgement = Judgement {};
+    };
+
+    // Shapes that draw one another's triangles are judged as one: the leader first, then its
+    // twins cut like it (ShelterTwins). A twin that cannot be, this time round, holds the leader
+    // back to the model's triangles too, so that the two never disagree
+    std::vector<bool> grouped(job.receivers.size(), false);
+    std::vector<Judgement> judgements;
+    for (TwinGroup& twins : twinGroups(job.receivers)) {
+        grouped[twins.leader] = true;
+        for (const std::size_t follower : twins.followers) {
+            grouped[follower] = true;
+        }
+        Lead lead;
+        Judgement leaderJudgement = judge(job.field, job.receivers[twins.leader], scratch, !twins.held, nullptr, &lead);
+        judgements.clear();
+        bool failed = false;
+        for (const std::size_t follower : twins.followers) {
+            judgements.push_back(judge(job.field,
+                                       job.receivers[follower],
+                                       scratch,
+                                       false,
+                                       lead.refinement.has_value() ? &lead : nullptr,
+                                       nullptr));
+            failed = failed || judgements.back().twinFailed;
+        }
+        if (failed) {
+            discard(leaderJudgement);
+            for (Judgement& judgement : judgements) {
+                discard(judgement);
+            }
+            leaderJudgement = judge(job.field, job.receivers[twins.leader], scratch, false, nullptr, nullptr);
+            judgements.clear();
+            for (const std::size_t follower : twins.followers) {
+                judgements.push_back(judge(job.field, job.receivers[follower], scratch, false, nullptr, nullptr));
+            }
+            result.unmet = true;
+        }
+        if (failed || twins.held) {
+            s_twinsHeld.fetch_add(1, std::memory_order_relaxed);
+        }
+        // The first few groups, and every one that could not be cut alike, go to the log: what a
+        // report of a twin that z-fights or lost its vertex fix is matched against
+        constexpr std::size_t K_LOGGED_GROUPS = 12;
+        static std::atomic<std::size_t> loggedGroups {0};
+        if (failed || twins.held || loggedGroups.fetch_add(1, std::memory_order_relaxed) < K_LOGGED_GROUPS) {
+            const Receiver& leader = job.receivers[twins.leader];
+            std::size_t carried = 0;
+            for (const Judgement& judgement : judgements) {
+                carried += (!judgement.keep && judgement.wanted != nullptr
+                            && ProjectedVertexData::countsOf(judgement.wanted).has_value())
+                    ? 1
+                    : 0;
+            }
+            const char* why = "";
+            if (failed) {
+                why = " - a twin could not take the topology, so none was refined";
+            } else if (twins.held) {
+                why = " - a twin cannot be cut alike (a LOD shape or another transform), so none was refined";
+            }
+            spdlog::info(
+                "Twin shapes of reference {:08X}: leader of {} triangles {}{}; {} twins, {} of them cut like it "
+                "this pass{}",
+                leader.reference,
+                leader.shape.triangleCount,
+                lead.refinement.has_value() ? "refined with " : "not refined",
+                lead.refinement.has_value() ? std::to_string(lead.refinement->added.size()) + " added vertices"
+                                            : std::string {},
+                twins.followers.size(),
+                carried,
+                why);
+        }
+        commit(job.receivers[twins.leader], leaderJudgement);
+        for (std::size_t item = 0; item < twins.followers.size(); ++item) {
+            commit(job.receivers[twins.followers[item]], judgements[item]);
+        }
+    }
+    for (std::size_t index = 0; index < job.receivers.size(); ++index) {
+        if (grouped[index]) {
+            continue;
+        }
+        Judgement judgement = judge(job.field, job.receivers[index], scratch, true, nullptr, nullptr);
+        commit(job.receivers[index], judgement);
     }
 
     result.receivers = std::move(job.receivers);
