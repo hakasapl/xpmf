@@ -5,8 +5,10 @@
 #include "MaterialClassifier.hpp"
 #include "PbrMaterialObjects.hpp"
 #include "ProjectedGeometry.hpp"
+#include "ProjectedLod.hpp"
 #include "ProjectedTextures.hpp"
 #include "SeasonsOfSkyrim.hpp"
+#include "Text.hpp"
 #include "TextureColor.hpp"
 
 #include "PCH.h"
@@ -45,8 +47,8 @@ auto describeForm(const RE::TESForm& form,
 void MaterialMatcher::onDataLoaded()
 {
     if (!ConfigLoader::isAnyMaterialPatched() && !ConfigLoader::isAnyGeometryChanged()
-        && !ConfigLoader::isAnySpecularChanged()) {
-        spdlog::info("No profile names a texture or a material value, or has neutralizeVertexColors, "
+        && !ConfigLoader::isAnySpecularChanged() && !ConfigLoader::isAnyLodMaterialNamed()) {
+        spdlog::info("No profile names a texture, a material value or a LOD material, or has neutralizeVertexColors, "
                      "neutralizeVertexAlpha, roofShelter or specularMult on: nothing to do");
         return;
     }
@@ -84,6 +86,33 @@ void MaterialMatcher::onDataLoaded()
     std::size_t named = 0;
     std::size_t total = 0;
     const RE::BGSMaterialObject* winterSnow = nullptr;
+
+    // A profile's LOD materials are its own whatever any pattern says: named outright, by the
+    // first profile in file order to name them (ProjectedLod)
+    struct LodClaim {
+        const ConfigLoader::Profile* profile {};
+        std::string_view key;
+    };
+    std::unordered_map<std::string, LodClaim> lodClaims;
+    for (const auto& profile : ConfigLoader::getProfiles()) {
+        for (const auto& [id, key] : {
+                 std::pair {&profile.lodMaterial, std::string_view {"lodMaterial"}},
+                 std::pair {&profile.lodMaterialHD, std::string_view {"lodMaterialHD"}},
+             }) {
+            if (id->empty()) {
+                continue;
+            }
+            const auto [claim, fresh] = lodClaims.emplace(*id, LodClaim {.profile = &profile, .key = key});
+            if (!fresh && claim->second.profile != &profile) {
+                spdlog::warn("Profile '{}': its {} {} is already the LOD material of profile '{}', which keeps it",
+                             profile.label(),
+                             key,
+                             *id,
+                             claim->second.profile->label());
+            }
+        }
+    }
+    std::unordered_map<std::string, RE::BGSMaterialObject*> byEditorId; // lower case; single pass ones
     for (auto* const material : dataHandler->GetFormArray<RE::BGSMaterialObject>()) {
         if (material == nullptr) {
             continue;
@@ -93,6 +122,15 @@ void MaterialMatcher::onDataLoaded()
         auto verdict = MaterialClassifier::classify(*material);
         if (!verdict.editorId.empty()) {
             ++named;
+            const std::string lowerId = Text::toLower(verdict.editorId);
+            if (MaterialClassifier::isSinglePass(*material)) {
+                byEditorId.emplace(lowerId, material);
+            }
+            if (const auto claim = lodClaims.find(lowerId); claim != lodClaims.end()) {
+                verdict.profile = claim->second.profile;
+                verdict.reason = MaterialClassifier::Reason::LOD_MATERIAL;
+                verdict.pattern = claim->second.key;
+            }
         }
         // Seasons of Skyrim projects this one's values onto clones by itself, which no static's
         // material says; ProjectedGeometry has to know which record that is
@@ -287,6 +325,44 @@ void MaterialMatcher::onDataLoaded()
             }
         }
     }
+
+    // What the object LOD shapes of each profile's statics are named and get (ProjectedLod): the
+    // profile's LOD materials, where the load order has them as single pass records that no
+    // earlier profile claimed
+    std::vector<ProjectedLod::Entry> lodEntries;
+    for (const auto& profile : ConfigLoader::getProfiles()) {
+        if (profile.lodMaterial.empty()) {
+            continue;
+        }
+        const auto resolve = [&](const std::string& id, std::string_view key) -> RE::BGSMaterialObject* {
+            const auto claim = lodClaims.find(id);
+            if (claim == lodClaims.end() || claim->second.profile != &profile) {
+                return nullptr; // another profile's
+            }
+            const auto found = byEditorId.find(id);
+            if (found == byEditorId.end()) {
+                spdlog::warn("Profile '{}': {} {} is no single pass material object of the load order, so the "
+                             "shapes named {} stay as they are",
+                             profile.label(),
+                             key,
+                             id,
+                             profile.lodIdentifier);
+                return nullptr;
+            }
+            return found->second;
+        };
+        auto* const material = resolve(profile.lodMaterial, "lodMaterial");
+        if (material == nullptr) {
+            continue;
+        }
+        auto* const materialHD
+            = profile.lodMaterialHD.empty() ? material : resolve(profile.lodMaterialHD, "lodMaterialHD");
+        lodEntries.push_back({.identifier = profile.lodIdentifier,
+                              .material = material,
+                              .materialHD = materialHD != nullptr ? materialHD : material,
+                              .profile = &profile});
+    }
+    ProjectedLod::onMaterialsReady(std::move(lodEntries));
 
     // Everything above changed what a projection looks like; this changes which vertices it looks
     // like that on (vertex colors and roof shelter, see ProjectedGeometry)

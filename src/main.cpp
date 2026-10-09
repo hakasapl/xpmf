@@ -2,6 +2,7 @@
 #include "IniSettings.hpp"
 #include "MaterialMatcher.hpp"
 #include "ProjectedGeometry.hpp"
+#include "ProjectedLod.hpp"
 #include "ProjectedTextures.hpp"
 
 #include "PCH.h"
@@ -77,6 +78,9 @@ SKSEPluginInfo(.Version = REL::Version {PLUGIN_VERSION_MAJOR,
     ConfigLoader::loadConfig();
     if (ConfigLoader::isAnyMaterialPatched()) {
         ProjectedTextures::install();
+    }
+    if (ConfigLoader::isAnyLodMaterialNamed()) {
+        ProjectedLod::install(); // a vtable slot too, on the one class object LOD shapes are
     }
 
     SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* message) -> void {

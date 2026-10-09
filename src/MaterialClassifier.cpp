@@ -75,6 +75,8 @@ auto MaterialClassifier::describe(Reason reason) -> std::string_view
     switch (reason) {
     case Reason::EDITOR_ID:
         return "EditorID pattern";
+    case Reason::LOD_MATERIAL:
+        return "named as a LOD material";
     case Reason::EXCLUDED:
         return "excluded by EditorID pattern";
     case Reason::NOT_PBR:
