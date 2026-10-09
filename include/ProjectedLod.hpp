@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <deque>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -38,14 +37,16 @@ namespace XPMF {
  * builds for those statics objMoss, objMossHD, objMoss-LargeRef and objMossHD-LargeRef, exactly
  * as it names the game's. The hook is a vtable slot on BSSubIndexTriShape, the one class object
  * LOD shapes are: PostLinkObject, which runs for every shape of a *.bto as it is read, once its
- * shader property is linked and before the block is prepared. A shape whose name, suffix
- * stripped, is a profile's identifier gets the profile's LOD material exactly as Prepare gives
- * the game's own - CommonLib's NiAVObject::SetProjectedUVData is that helper - and one named
- * with the HD suffix gets the HD material and the HD angle, as Prepare does for objsnowHD.
- * Prepare then runs as always and leaves the shape alone, its name being none of its four; the
- * four themselves are left to it, whatever a profile says. The draw hook (ProjectedTextures)
- * swaps the profile's textures in for such a shape as for every projected draw, the material's
- * color carrying the tag.
+ * shader property is linked and before the block is prepared. Only the beginning of a shape's
+ * name is read: one that begins with a profile's identifier gets the profile's LOD material
+ * exactly as Prepare gives the game's own - CommonLib's NiAVObject::SetProjectedUVData is that
+ * helper - and one with HD right after the identifier gets the HD material and the HD angle, as
+ * Prepare does for objsnowHD; whatever follows, -LargeRef or anything else the generator may
+ * append, is not looked at, and of two identifiers a name begins with the longer one counts.
+ * Prepare then runs as always and leaves the shape alone, its name being none of the game's; a
+ * name beginning with objsnow or objash is left to it, whatever a profile says. The draw hook
+ * (ProjectedTextures) swaps the profile's textures in for such a shape as for every projected
+ * draw, the material's color carrying the tag.
  *
  * Only the material is this plugin's business. Which statics get LOD, which shapes are HD and
  * what vertex alpha they carry are the generator's; the material's falloff and noise UV scale
@@ -67,11 +68,10 @@ public:
         const ConfigLoader::Profile* profile {}; /**< For the log */
     };
 
-    constexpr static std::array<const char*, 2> K_GAME_IDENTIFIERS {"objsnow", "objash"}; /**< The game's own,
-                                                                                               with their HD and
-                                                                                               -LargeRef names:
-                                                                                               Prepare's, never
-                                                                                               this hook's */
+    constexpr static std::array<const char*, 2> K_GAME_IDENTIFIERS {"objsnow", "objash"}; /**< The game's own: a
+                                                                                               name beginning with
+                                                                                               either is Prepare's,
+                                                                                               never this hook's */
 
     /**
      * @brief Installs the PostLinkObject hook; SKSE load callback. Does nothing until onMaterialsReady()
@@ -84,10 +84,8 @@ public:
     static void onMaterialsReady(std::vector<Entry> entries);
 
 private:
-    constexpr static const char* K_HD_SUFFIX = "hd"; /**< objsnowHD: the HD material and the HD angle */
-    constexpr static const char* K_LARGE_REF_SUFFIX = "-largeref"; /**< The generator's suffix on the shapes of large
-                                                                      references: the engine takes objsnow-LargeRef
-                                                                      for objsnow, this takes it off any name */
+    constexpr static const char* K_HD_SUFFIX = "hd"; /**< objsnowHD - right after the identifier: the HD material
+                                                        and the HD angle */
     constexpr static const char* K_LOD_ANGLE = "fLODSnowThresholdAngle:Terrain"; /**< What Prepare takes for the max
                                                                                     angle on a plain name... */
     constexpr static const char* K_HD_LOD_ANGLE = "fHDLODSnowThresholdAngle:Terrain"; /**< ...and on an HD one */
@@ -119,11 +117,11 @@ private:
     };
 
     /**
-     * @brief What one shape name stands for
+     * @brief A name object LOD shapes may begin with, and whose it is
      */
-    struct Target {
-        Registered* registered {};
-        bool hd {};
+    struct Candidate {
+        std::string identifier;
+        Registered* registered {}; /**< nullptr: the game's own, Prepare's */
     };
 
     /**
@@ -137,7 +135,8 @@ private:
     [[nodiscard]] static auto angleOf(bool hd) -> float;
 
     static inline std::deque<Registered> s_registered; /**< Stable addresses: the map points into it */
-    static inline std::unordered_map<std::string, Target> s_byName; /**< objmoss and objmosshd alike */
+    static inline std::vector<Candidate> s_candidates; /**< Longest identifier first: of two a name begins with, the
+                                                          longer one counts */
     static inline RE::Setting* s_lodAngle = nullptr; /**< The two INI settings, resolved once */
     static inline RE::Setting* s_hdLodAngle = nullptr;
     static inline std::atomic<bool> s_ready {false}; /**< Gates the hook until the names are final */

@@ -44,6 +44,17 @@ void ProjectedLod::onMaterialsReady(std::vector<Entry> entries)
         const auto* const file = material.GetFile();
         return std::format("[{:08X} {}]", material.GetFormID(), file != nullptr ? file->GetFilename() : "?");
     };
+    const auto owner = [](const Candidate& candidate) -> std::string {
+        if (candidate.registered == nullptr) {
+            return "the game";
+        }
+        const auto* const profile = candidate.registered->entry.profile;
+        return std::format("profile '{}'", profile != nullptr ? profile->label() : std::string {"?"});
+    };
+    // The game's own first, so that a name beginning with either is left to Prepare
+    for (const char* const identifier : K_GAME_IDENTIFIERS) {
+        s_candidates.push_back({.identifier = identifier, .registered = nullptr});
+    }
     for (auto& entry : entries) {
         if (entry.identifier.empty() || entry.material == nullptr) {
             continue;
@@ -56,30 +67,55 @@ void ProjectedLod::onMaterialsReady(std::vector<Entry> entries)
                          label);
             continue;
         }
+        const auto claimed = std::ranges::find(s_candidates, entry.identifier, &Candidate::identifier);
+        if (claimed != s_candidates.end()) {
+            spdlog::warn("Object LOD: profile '{}' claims {} as well; the first claim, by {}, stands",
+                         label,
+                         entry.identifier,
+                         owner(*claimed));
+            continue;
+        }
         if (entry.materialHD == nullptr) {
             entry.materialHD = entry.material;
         }
         Registered& registered = s_registered.emplace_back(std::move(entry));
-        const std::string hdName = registered.entry.identifier + K_HD_SUFFIX;
-        if (!s_byName.emplace(registered.entry.identifier, Target {.registered = &registered, .hd = false}).second) {
-            s_registered.pop_back(); // claimed twice; the first stands
-            continue;
-        }
-        s_byName.emplace(hdName, Target {.registered = &registered, .hd = true});
+        s_candidates.push_back({.identifier = registered.entry.identifier, .registered = &registered});
         spdlog::info("Object LOD: shapes named {} get material object {} and shapes named {} get {} (profile '{}'), "
-                     "with or without -LargeRef, projected at {:g} degrees, {:g} for the HD name",
+                     "whatever the generator appends to the name, projected at {:g} degrees, {:g} for the HD name",
                      registered.entry.identifier,
                      describe(*registered.entry.material),
-                     hdName,
+                     registered.entry.identifier + K_HD_SUFFIX,
                      describe(*registered.entry.materialHD),
                      label,
                      angleOf(false),
                      angleOf(true));
     }
-    if (s_byName.empty()) {
+    if (s_registered.empty()) {
         spdlog::info("Object LOD: no profile names a LOD material of its own, so only the game's own objsnow and "
                      "objash shapes are projected");
         return;
+    }
+    // Only the beginning of a shape's name is read, so of two identifiers a name begins with the
+    // longer one has to be tried first
+    std::ranges::sort(s_candidates, [](const Candidate& left, const Candidate& right) -> bool {
+        if (left.identifier.size() != right.identifier.size()) {
+            return left.identifier.size() > right.identifier.size();
+        }
+        return left.identifier < right.identifier;
+    });
+    for (const auto& longer : s_candidates) {
+        for (const auto& shorter : s_candidates) {
+            if (longer.identifier.size() > shorter.identifier.size()
+                && longer.identifier.starts_with(shorter.identifier)) {
+                spdlog::info("Object LOD: {} begins with {}; the longer identifier counts, so shapes named {}... go "
+                             "to {}, not {}",
+                             longer.identifier,
+                             shorter.identifier,
+                             longer.identifier,
+                             owner(longer),
+                             owner(shorter));
+            }
+        }
     }
     s_ready.store(true, std::memory_order_release);
 }
@@ -98,35 +134,33 @@ void ProjectedLod::onShapeLinked(RE::BSSubIndexTriShape& shape)
     if (shape.name.empty()) {
         return;
     }
-    std::string name = Text::toLower(shape.name.c_str());
-    constexpr std::string_view SUFFIX {K_LARGE_REF_SUFFIX};
-    if (name.ends_with(SUFFIX)) {
-        name.resize(name.size() - SUFFIX.size());
+    const std::string name = Text::toLower(shape.name.c_str());
+    const auto found = std::ranges::find_if(
+        s_candidates, [&name](const Candidate& candidate) -> bool { return name.starts_with(candidate.identifier); });
+    if (found == s_candidates.end() || found->registered == nullptr) {
+        return; // no profile's, or the game's own: Prepare's
     }
-    const auto found = s_byName.find(name);
-    if (found == s_byName.end()) {
-        return;
-    }
-    const Target target = found->second;
-    Registered& registered = *target.registered;
+    Registered& registered = *found->registered;
+    // objMoss, objMossHD, objMoss-LargeRef, objMossHD-LargeRef: HD right after the identifier
+    // means the HD material and angle, and what follows either is not read
+    const bool hd = std::string_view {name}.substr(found->identifier.size()).starts_with(K_HD_SUFFIX);
 
     // What Prepare does for the game's four: the record's values as they stand, the HD material
     // and angle for the HD name
-    const RE::BGSMaterialObject& material = target.hd ? *registered.entry.materialHD : *registered.entry.material;
+    const RE::BGSMaterialObject& material = hd ? *registered.entry.materialHD : *registered.entry.material;
     const auto& data = material.directionalData;
     constexpr float DEGREES = 0.017453292F; /**< What the engine multiplies the angle by */
     const float noiseScale = data.noiseUVScale > 0.0F ? data.noiseUVScale : 1.0F;
-    const RE::NiColorA params {
-        data.falloffScale, data.falloffBias, 1.0F / noiseScale, std::cos(angleOf(target.hd) * DEGREES)};
+    const RE::NiColorA params {data.falloffScale, data.falloffBias, 1.0F / noiseScale, std::cos(angleOf(hd) * DEGREES)};
     const bool snow = data.flags.any(RE::BSMaterialObject::DIRECTIONAL_DATA::Flag::kSnow);
     if (!shape.SetProjectedUVData(params, data.singlePassColor, snow)) {
         return;
     }
-    std::atomic<bool>& logged = target.hd ? registered.loggedHD : registered.logged;
+    std::atomic<bool>& logged = hd ? registered.loggedHD : registered.logged;
     if (!logged.exchange(true)) {
         spdlog::info("Object LOD: '{}' is the first shape to get {} of profile '{}'",
                      shape.name.c_str(),
-                     target.hd ? registered.entry.identifier + K_HD_SUFFIX : registered.entry.identifier,
+                     hd ? registered.entry.identifier + K_HD_SUFFIX : registered.entry.identifier,
                      registered.entry.profile != nullptr ? registered.entry.profile->label() : "?");
     }
 }

@@ -96,7 +96,8 @@ public:
         std::string lodIdentifier; /**< Lower case: what the LOD generator names the object LOD shapes of the
                                       profile's statics, the way the game's are named objsnow and objash -
                                       "obj" and the profile's name unless the file says otherwise; the HD
-                                      shapes carry it with HD appended, large references with -LargeRef */
+                                      shapes carry it with HD appended, and only the beginning of a name is
+                                      read, so what follows (-LargeRef on large references) does not matter */
         std::string lodMaterial; /**< EditorID, lower case, of the material object those shapes are given
                                     (ProjectedLod); empty = none, the game's own objsnow and objash apart */
         std::string lodMaterialHD; /**< Same for the HD shapes (full textures, the nearest level); empty = the
