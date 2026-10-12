@@ -35,16 +35,32 @@ auto MaterialClassifier::classify(const RE::BGSMaterialObject& material) -> Verd
         return best;
     };
 
+    // A profile's LOD materials are its own outright, named rather than matched (lodMaterial,
+    // lodMaterialHD): above any pattern and its own exclusions, but gated like a pattern - a pbr
+    // profile takes a material it names no more than any other without a True PBR configuration
+    const auto namedAs = [&](const ConfigLoader::Profile& profile) -> std::string_view {
+        if (profile.lodMaterial == lowerId) {
+            return "lodMaterial";
+        }
+        if (profile.lodMaterialHD == lowerId) {
+            return "lodMaterialHD";
+        }
+        return {};
+    };
+    // A pattern that matches has at most as many literals as the EditorID has characters
+    const Specificity named {.literals = static_cast<int>(lowerId.size()) + 1, .wildcards = 0};
+
     // ...and of all profiles the one whose best pattern is most specific; a pbr profile beats
     // a general one at the same pattern (it matches fewer materials), and the first file name in
     // alphabetical order - the order ConfigLoader hands the profiles out in - beats a later one
     std::optional<Specificity> best;
     for (const auto& profile : ConfigLoader::getProfiles()) {
-        const std::string* const pattern = bestMatch(profile.editorIds);
-        if (pattern == nullptr) {
+        const std::string_view key = namedAs(profile);
+        const std::string* const pattern = key.empty() ? bestMatch(profile.editorIds) : nullptr;
+        if (key.empty() && pattern == nullptr) {
             continue;
         }
-        if (bestMatch(profile.excludeEditorIds) != nullptr) {
+        if (key.empty() && bestMatch(profile.excludeEditorIds) != nullptr) {
             verdict.reason = verdict.profile == nullptr ? Reason::EXCLUDED : verdict.reason;
             continue;
         }
@@ -52,14 +68,14 @@ auto MaterialClassifier::classify(const RE::BGSMaterialObject& material) -> Verd
             verdict.reason = verdict.profile == nullptr ? Reason::NOT_PBR : verdict.reason;
             continue;
         }
-        const Specificity candidate = specificity(*pattern);
+        const Specificity candidate = key.empty() ? specificity(*pattern) : named;
         const bool better
             = !best.has_value() || candidate > *best || (candidate == *best && profile.pbr && !verdict.profile->pbr);
         if (better) {
             best = candidate;
             verdict.profile = &profile;
-            verdict.pattern = *pattern;
-            verdict.reason = Reason::EDITOR_ID;
+            verdict.pattern = key.empty() ? *pattern : std::string {key};
+            verdict.reason = key.empty() ? Reason::EDITOR_ID : Reason::LOD_MATERIAL;
         }
     }
     return verdict;
@@ -75,6 +91,8 @@ auto MaterialClassifier::describe(Reason reason) -> std::string_view
     switch (reason) {
     case Reason::EDITOR_ID:
         return "EditorID pattern";
+    case Reason::LOD_MATERIAL:
+        return "named as a LOD material";
     case Reason::EXCLUDED:
         return "excluded by EditorID pattern";
     case Reason::NOT_PBR:

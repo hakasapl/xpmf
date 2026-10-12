@@ -8,6 +8,8 @@
     "pbr": true,
     "diffuseTexture": "textures/pbr/landscape/snow01.dds",
     "normalTexture": "textures/pbr/landscape/snow01_n.dds",
+    "lodMaterial": "SnowLODMaterial",
+    "lodMaterialHD": "SnowLODMaterialHD",
     "neutralizeVertexColors": true,
     "neutralizeVertexAlpha": true,
     "neutralizeVertexAlphaSkip": [

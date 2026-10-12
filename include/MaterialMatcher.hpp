@@ -43,7 +43,9 @@ namespace XPMF {
  *  - Object LOD never looks at a STAT. The "objsnow" / "objsnowHD" LOD shapes take the same six
  *    values (0x505970) from SnowLODMaterial / SnowLODMaterialHD, which the engine fetches as
  *    default objects - at an index that moved between AE builds (331 in CommonLib's tables,
- *    320 in 1.7.99), so they are best found by name like every other material.
+ *    320 in 1.7.99), so they are best found by name like every other material. A profile's
+ *    lodMaterial and lodMaterialHD go the same way onto the LOD shapes named after them
+ *    (ProjectedLod), which is this plugin's way of adding to the four.
  *
  * A single pass material has no texture of its own - but the shader gives it one: every covered
  * pixel samples ProjectedDiffuse, a texture the engine loads once from a hardcoded path and binds
