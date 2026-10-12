@@ -62,6 +62,13 @@ namespace XPMF {
  * "*snow*"; with as many literals, the one with fewer wildcards), then a "pbr" profile over one
  * for any material (it matches a subset), then the first file name in alphabetical order (the
  * order ConfigLoader hands the profiles out in).
+ *
+ * A material a profile names as its LOD material (lodMaterial, lodMaterialHD) is that profile's
+ * outright, more specifically than any pattern could make it and its exclusions notwithstanding;
+ * the "pbr" condition holds all the same, and between two profiles naming it the "pbr" one and
+ * then the first file win, as for patterns. Whether True PBR has a configuration for the record
+ * is of no account to object LOD: Community Shaders applies such a configuration in Clone3D, to
+ * the PBR materials of a static's model, and the LOD shapes (ProjectedLod) never pass there.
  */
 class MaterialClassifier {
 public:
@@ -72,7 +79,8 @@ public:
      */
     enum class Reason : std::uint8_t {
         EDITOR_ID, /**< The profile's pattern matched */
-        LOD_MATERIAL, /**< Named as a profile's LOD material (lodMaterial, lodMaterialHD), which beats any pattern */
+        LOD_MATERIAL, /**< Named as a profile's LOD material (lodMaterial, lodMaterialHD), which beats any pattern;
+                         between profiles naming it, a pbr one and then the first file wins, as with patterns */
         EXCLUDED, /**< A profile's patterns matched, but so did one of its exclusions, and no other profile took it */
         NOT_PBR, /**< A profile's patterns matched, but it is a pbr profile and True PBR has no configuration for the
                     material, and no other profile took it */

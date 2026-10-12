@@ -8,7 +8,9 @@
 #include <atomic>
 #include <cstddef>
 #include <deque>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -37,16 +39,17 @@ namespace XPMF {
  * builds for those statics objMoss, objMossHD, objMoss-LargeRef and objMossHD-LargeRef, exactly
  * as it names the game's. The hook is a vtable slot on BSSubIndexTriShape, the one class object
  * LOD shapes are: PostLinkObject, which runs for every shape of a *.bto as it is read, once its
- * shader property is linked and before the block is prepared. Only the beginning of a shape's
- * name is read: one that begins with a profile's identifier gets the profile's LOD material
- * exactly as Prepare gives the game's own - CommonLib's NiAVObject::SetProjectedUVData is that
- * helper - and one with HD right after the identifier gets the HD material and the HD angle, as
- * Prepare does for objsnowHD; whatever follows, -LargeRef or anything else the generator may
- * append, is not looked at, and of two identifiers a name begins with the longer one counts.
- * Prepare then runs as always and leaves the shape alone, its name being none of the game's; a
- * name beginning with objsnow or objash is left to it, whatever a profile says. The draw hook
- * (ProjectedTextures) swaps the profile's textures in for such a shape as for every projected
- * draw, the material's color carrying the tag.
+ * shader property is linked and before the block is prepared. A shape whose name is a profile's
+ * identifier, or that with HD appended, and then nothing or a dash and whatever the generator
+ * puts there (-LargeRef, or anything else to come) gets the profile's LOD material exactly as
+ * Prepare gives the game's own - CommonLib's NiAVObject::SetProjectedUVData is that helper -
+ * the HD material and the HD angle for the HD name, as Prepare does for objsnowHD; any other
+ * character after the name (objMossy, objMossHDx) makes it some other name. A name that is two
+ * identifiers' (objMossHD-LargeRef is objMoss's HD name and objMossHD's plain one) goes to the
+ * longer. Prepare then runs as always and leaves the shape alone, its name being none of the
+ * game's; a name that is the game's, objsnow or objash with the same endings, is left to it,
+ * whatever a profile says. The draw hook (ProjectedTextures) swaps the profile's textures in
+ * for such a shape as for every projected draw, the material's color carrying the tag.
  *
  * Only the material is this plugin's business. Which statics get LOD, which shapes are HD and
  * what vertex alpha they carry are the generator's; the material's falloff and noise UV scale
@@ -69,9 +72,9 @@ public:
     };
 
     constexpr static std::array<const char*, 2> K_GAME_IDENTIFIERS {"objsnow", "objash"}; /**< The game's own: a
-                                                                                               name beginning with
-                                                                                               either is Prepare's,
-                                                                                               never this hook's */
+                                                                                               name of either is
+                                                                                               Prepare's, never this
+                                                                                               hook's */
 
     /**
      * @brief Installs the PostLinkObject hook; SKSE load callback. Does nothing until onMaterialsReady()
@@ -86,6 +89,8 @@ public:
 private:
     constexpr static const char* K_HD_SUFFIX = "hd"; /**< objsnowHD - right after the identifier: the HD material
                                                         and the HD angle */
+    constexpr static char K_SEPARATOR = '-'; /**< What may follow either name, with anything after it:
+                                                objsnow-LargeRef */
     constexpr static const char* K_LOD_ANGLE = "fLODSnowThresholdAngle:Terrain"; /**< What Prepare takes for the max
                                                                                     angle on a plain name... */
     constexpr static const char* K_HD_LOD_ANGLE = "fHDLODSnowThresholdAngle:Terrain"; /**< ...and on an HD one */
@@ -117,14 +122,6 @@ private:
     };
 
     /**
-     * @brief A name object LOD shapes may begin with, and whose it is
-     */
-    struct Candidate {
-        std::string identifier;
-        Registered* registered {}; /**< nullptr: the game's own, Prepare's */
-    };
-
-    /**
      * @brief Gives a freshly read LOD shape its material, if it carries an identifier
      */
     static void onShapeLinked(RE::BSSubIndexTriShape& shape);
@@ -134,9 +131,18 @@ private:
      */
     [[nodiscard]] static auto angleOf(bool hd) -> float;
 
-    static inline std::deque<Registered> s_registered; /**< Stable addresses: the map points into it */
-    static inline std::vector<Candidate> s_candidates; /**< Longest identifier first: of two a name begins with, the
-                                                          longer one counts */
+    /**
+     * @brief Whether a lower case shape name is an identifier's: the identifier, HD or not, and then nothing or
+     * a dash and anything (objmoss, objmosshd, objmoss-largeref, objmosshd-largeref)
+     *
+     * @return std::optional<bool> Whether it is the HD name; std::nullopt when the name is not the identifier's
+     */
+    [[nodiscard]] static auto nameOf(std::string_view identifier,
+                                     std::string_view name) -> std::optional<bool>;
+
+    static inline std::deque<Registered> s_registered; /**< Stable addresses: the list below points into it */
+    static inline std::vector<Registered*> s_candidates; /**< The same, longest identifier first: a name that is two
+                                                            identifiers' goes to the longer */
     static inline RE::Setting* s_lodAngle = nullptr; /**< The two INI settings, resolved once */
     static inline RE::Setting* s_hdLodAngle = nullptr;
     static inline std::atomic<bool> s_ready {false}; /**< Gates the hook until the names are final */

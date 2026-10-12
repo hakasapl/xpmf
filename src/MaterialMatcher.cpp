@@ -87,32 +87,9 @@ void MaterialMatcher::onDataLoaded()
     std::size_t total = 0;
     const RE::BGSMaterialObject* winterSnow = nullptr;
 
-    // A profile's LOD materials are its own whatever any pattern says: named outright, by the
-    // first profile in file order to name them (ProjectedLod)
-    struct LodClaim {
-        const ConfigLoader::Profile* profile {};
-        std::string_view key;
-    };
-    std::unordered_map<std::string, LodClaim> lodClaims;
-    for (const auto& profile : ConfigLoader::getProfiles()) {
-        for (const auto& [id, key] : {
-                 std::pair {&profile.lodMaterial, std::string_view {"lodMaterial"}},
-                 std::pair {&profile.lodMaterialHD, std::string_view {"lodMaterialHD"}},
-             }) {
-            if (id->empty()) {
-                continue;
-            }
-            const auto [claim, fresh] = lodClaims.emplace(*id, LodClaim {.profile = &profile, .key = key});
-            if (!fresh && claim->second.profile != &profile) {
-                spdlog::warn("Profile '{}': its {} {} is already the LOD material of profile '{}', which keeps it",
-                             profile.label(),
-                             key,
-                             *id,
-                             claim->second.profile->label());
-            }
-        }
-    }
-    std::unordered_map<std::string, RE::BGSMaterialObject*> byEditorId; // lower case; single pass ones
+    // The single pass records by lower case EditorID, for the LOD materials profiles name
+    // (ProjectedLod)
+    std::unordered_map<std::string, RE::BGSMaterialObject*> byEditorId;
     for (auto* const material : dataHandler->GetFormArray<RE::BGSMaterialObject>()) {
         if (material == nullptr) {
             continue;
@@ -122,14 +99,8 @@ void MaterialMatcher::onDataLoaded()
         auto verdict = MaterialClassifier::classify(*material);
         if (!verdict.editorId.empty()) {
             ++named;
-            const std::string lowerId = Text::toLower(verdict.editorId);
             if (MaterialClassifier::isSinglePass(*material)) {
-                byEditorId.emplace(lowerId, material);
-            }
-            if (const auto claim = lodClaims.find(lowerId); claim != lodClaims.end()) {
-                verdict.profile = claim->second.profile;
-                verdict.reason = MaterialClassifier::Reason::LOD_MATERIAL;
-                verdict.pattern = claim->second.key;
+                byEditorId.emplace(Text::toLower(verdict.editorId), material);
             }
         }
         // Seasons of Skyrim projects this one's values onto clones by itself, which no static's
@@ -327,26 +298,23 @@ void MaterialMatcher::onDataLoaded()
     }
 
     // What the object LOD shapes of each profile's statics are named and get (ProjectedLod): the
-    // profile's LOD materials, where the load order has them as single pass records that no
-    // earlier profile claimed
+    // profile's LOD materials, where the load order has them as single pass records - whichever
+    // profile the records themselves went to above, and whether or not True PBR has a
+    // configuration for them (Community Shaders applies one to a static's PBR materials in
+    // Clone3D, which LOD shapes never pass through)
     std::vector<ProjectedLod::Entry> lodEntries;
     for (const auto& profile : ConfigLoader::getProfiles()) {
         if (profile.lodMaterial.empty()) {
             continue;
         }
         const auto resolve = [&](const std::string& id, std::string_view key) -> RE::BGSMaterialObject* {
-            const auto claim = lodClaims.find(id);
-            if (claim == lodClaims.end() || claim->second.profile != &profile) {
-                return nullptr; // another profile's
-            }
             const auto found = byEditorId.find(id);
             if (found == byEditorId.end()) {
-                spdlog::warn("Profile '{}': {} {} is no single pass material object of the load order, so the "
-                             "shapes named {} stay as they are",
+                spdlog::warn("Profile '{}': {} {} is no single pass material object of the load order, so it is "
+                             "ignored",
                              profile.label(),
                              key,
-                             id,
-                             profile.lodIdentifier);
+                             id);
                 return nullptr;
             }
             return found->second;
