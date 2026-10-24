@@ -126,6 +126,13 @@
             "default": 64,
             "description": "World units over which the projection fades out under cover: 0 is a hard edge at the drip line, 64 about how far wind carries snow in under an eave. Whatever the material, the projection is visibly half gone half way through."
         },
+        "shelterRandomness": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 128,
+            "default": 32,
+            "description": "World units the snow's edge under cover swings in and out along an eave at most, so that it is not a straight line: waves of random depth, about a hundred units apart, the deepest close to this far either way from where the fade puts the edge (half way through shelterFade). 0 keeps the edge straight. The edge never comes out past the drip line: a swing towards it eases off short of it. The waves follow smooth noise over the ground, the same for every object at a spot, and are carried by the vertices the shape has (with roofShelterFixVertices, the ones it adds along the drip line): no vertices are added for them. Does nothing without roofShelter."
+        },
         "specularMult": {
             "type": ["number", "null"],
             "minimum": 0,

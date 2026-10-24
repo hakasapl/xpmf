@@ -79,7 +79,8 @@ namespace XPMF {
  *    judgement waits for its own roofs only, its neighbors' coming in over the next seconds and a
  *    second pass following them; every later one waits for the whole neighborhood. In the open ->
  *    keeps the shared variant, partly covered -> a private variant whose alpha fades with the
- *    distance under cover (and, with the profile's roofShelterFixVertices, with the vertices
+ *    distance under cover, a distance that swings in and out along the eave by the profile's
+ *    shelterRandomness (ShelterMap::Fade::distanceAt) (and, with roofShelterFixVertices, with the vertices
  *    ShelterRefinement adds where the mesh is too coarse to carry that fade, cut into every
  *    shape of the model drawing the same triangles as well, see ShelterTwins), sheltered -> its
  *    projected snow is switched off (the Projected_UV
@@ -250,6 +251,7 @@ private:
         float noiseAmplitude {}; /**< (1 - cos) * scale: how far the noise texture can raise that */
         float meanNoise {}; /**< ...on average: the mean of the coverage noise the shape's draws sample */
         float fade {}; /**< The profile's shelterFade */
+        float randomness {}; /**< ...and shelterRandomness */
         bool isSnow {}; /**< Whether the material's snow flag is set, i.e. whether the engine set the Snow shader
                            flag next to Projected_UV */
         bool alphaTest {}; /**< The shape is alpha tested (ShapeView::alphaTest): its threshold follows its alpha */

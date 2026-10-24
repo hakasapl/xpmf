@@ -32,7 +32,75 @@ auto nodeIndex(int localX,
         + static_cast<std::size_t>(localX);
 }
 
+/**
+ * @brief Gradient noise (Perlin's) at a point of a unit lattice, about -0.7..0.7: each lattice
+ * point gets one of eight directions from a hash of its coordinates, and the dot products
+ * with them are blended with the quintic fade
+ *
+ * @param seed Picks an independent pattern
+ */
+auto gradientNoise(float x,
+                   float y,
+                   std::uint32_t seed) -> float
+{
+    constexpr float DIAGONAL = 0.70710678F;
+    constexpr std::array<std::array<float, 2>, 8> DIRECTIONS {{{1.0F, 0.0F},
+                                                               {DIAGONAL, DIAGONAL},
+                                                               {0.0F, 1.0F},
+                                                               {-DIAGONAL, DIAGONAL},
+                                                               {-1.0F, 0.0F},
+                                                               {-DIAGONAL, -DIAGONAL},
+                                                               {0.0F, -1.0F},
+                                                               {DIAGONAL, -DIAGONAL}}};
+    const float floorX = std::floor(x);
+    const float floorY = std::floor(y);
+    const auto cornerX = static_cast<std::int32_t>(floorX);
+    const auto cornerY = static_cast<std::int32_t>(floorY);
+    const float fractionX = x - floorX;
+    const float fractionY = y - floorY;
+    const auto gradient = [&](std::int32_t offsetX, std::int32_t offsetY) -> float {
+        // A 32 bit integer hash of the lattice point (murmur's finalizer over a mix of the two)
+        auto hash = (static_cast<std::uint32_t>(cornerX + offsetX) * 0x8DA6B343U)
+            ^ (static_cast<std::uint32_t>(cornerY + offsetY) * 0xD8163841U) ^ seed;
+        hash ^= hash >> 16U;
+        hash *= 0x85EBCA6BU;
+        hash ^= hash >> 13U;
+        hash *= 0xC2B2AE35U;
+        hash ^= hash >> 16U;
+        const auto& direction = DIRECTIONS.at(hash & 7U);
+        return (direction[0] * (fractionX - static_cast<float>(offsetX)))
+            + (direction[1] * (fractionY - static_cast<float>(offsetY)));
+    };
+    const auto quintic = [](float t) -> float { return t * t * t * ((t * ((t * 6.0F) - 15.0F)) + 10.0F); };
+    const float blendX = quintic(fractionX);
+    const float blendY = quintic(fractionY);
+    const float south = std::lerp(gradient(0, 0), gradient(1, 0), blendX);
+    const float north = std::lerp(gradient(0, 1), gradient(1, 1), blendX);
+    return std::lerp(south, north, blendY);
+}
+
 } // namespace
+
+auto ShelterMap::swing(float x,
+                       float y) -> float
+{
+    // The main octave and one at a little under half its wavelength, weighted 2:1, both seeded
+    // apart. Gradient noise keeps close to 0 (a spread of a sixth of its range), so the sum is
+    // stretched until its spread is about half of -1..1, through a tanh rather than a clamp: each
+    // wave reaches out as far as its own bump does, the largest close to the full swing, and none
+    // is flattened against it
+    constexpr float FINE_RATIO = 2.3F;
+    constexpr float MAIN_WEIGHT = 2.0F / 3.0F;
+    constexpr float FINE_WEIGHT = 1.0F / 3.0F;
+    constexpr float GAIN = 3.5F;
+    constexpr std::uint32_t MAIN_SEED = 0x5EED0001U;
+    constexpr std::uint32_t FINE_SEED = 0x5EED0002U;
+    const float mainX = x / K_SWING_WAVELENGTH;
+    const float mainY = y / K_SWING_WAVELENGTH;
+    const float value = (MAIN_WEIGHT * gradientNoise(mainX, mainY, MAIN_SEED))
+        + (FINE_WEIGHT * gradientNoise(mainX * FINE_RATIO, mainY * FINE_RATIO, FINE_SEED));
+    return std::tanh(value * GAIN);
+}
 
 void ShelterMap::rasterize(std::array<Layer,
                                       K_BLOCK_CELLS>& layers,
@@ -128,14 +196,38 @@ auto ShelterMap::Slope::ofTriangle(const RE::NiPoint3& first,
 }
 
 auto ShelterMap::Fade::of(float distance,
-                          float edgeOpenness) -> Fade
+                          float edgeOpenness,
+                          float edgeThrow) -> Fade
 {
     // What the plain falloff is at the depth the edge is to lie at, raised to the power, is the
     // edge value. Kept off 0 and 1, where no power gets it there
     constexpr float MIN_EDGE = 0.01F;
     const float plain = 1.0F - (K_EDGE_DEPTH * K_EDGE_DEPTH * (3.0F - (2.0F * K_EDGE_DEPTH)));
     const float edge = std::clamp(edgeOpenness, MIN_EDGE, 1.0F - MIN_EDGE);
-    return {.distance = distance, .power = std::log(edge) / std::log(plain)};
+    return {.distance = distance, .power = std::log(edge) / std::log(plain), .edgeThrow = edgeThrow};
+}
+
+auto ShelterMap::Fade::distanceAt(const RE::NiPoint3& point) const -> float
+{
+    if (edgeThrow <= 0.0F) {
+        return distance;
+    }
+    // Where the edge would lie here. Swung out towards the drip line it eases off rather than
+    // reaching it: from three quarters of its usual depth it closes on a quarter of it
+    // exponentially, with no kink. The vertex fix puts its outermost row about on the drip line,
+    // so an edge let out that far would be pinned half way out to the next row, flat along the
+    // eave for as long as the wave lasted; eased, the outer bend of a wave is as round as the inner
+    constexpr float KNEE = 0.75F;
+    constexpr float FLOOR = 0.25F;
+    constexpr float MIN_DISTANCE = 1.0F;
+    const float usual = K_EDGE_DEPTH * distance;
+    float edge = usual + (edgeThrow * swing(point.x, point.y));
+    const float knee = KNEE * usual;
+    const float range = (KNEE - FLOOR) * usual;
+    if (edge < knee) {
+        edge = range > 0.0F ? (FLOOR * usual) + (range * std::exp((edge - knee) / range)) : 0.0F;
+    }
+    return std::max(edge / K_EDGE_DEPTH, MIN_DISTANCE);
 }
 
 auto ShelterMap::Field::topAt(int nodeX,
@@ -298,14 +390,15 @@ auto ShelterMap::Field::opennessAt(const RE::NiPoint3& point,
                                    const Slope& slope,
                                    const Fade& fade) const -> float
 {
-    // The fade, plus the spacing depthUnderCover's estimate gives up: a point deep under cover has
-    // to be able to reach 0, or nothing ever counts as covered
-    const float depth = depthUnderCover(point, slope, fade.distance + K_SPACING);
+    // The fade as it is here, plus the spacing depthUnderCover's estimate gives up: a point deep
+    // under cover has to be able to reach 0, or nothing ever counts as covered
+    const float distance = fade.distanceAt(point);
+    const float depth = depthUnderCover(point, slope, distance + K_SPACING);
     if (depth <= 0.0F) {
         return 1.0F;
     }
-    // A smooth step down over the distance, bent to the material (Fade)
-    const float t = fade.distance > 0.0F ? std::clamp(depth / fade.distance, 0.0F, 1.0F) : 1.0F;
+    // A smooth step down over that distance, bent to the material (Fade)
+    const float t = distance > 0.0F ? std::clamp(depth / distance, 0.0F, 1.0F) : 1.0F;
     return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), fade.power);
 }
 
@@ -451,10 +544,13 @@ void ShelterMap::Field::settleOpenness(std::span<const RE::NiPoint3> positions,
             return;
         }
         // Interpolated openness runs from 1 at the open end to the covered vertex's value; it has
-        // to pass edgeOpenness at the target fraction, which fixes that value
+        // to pass edgeOpenness at the target fraction, which fixes that value. The edge lies
+        // K_EDGE_DEPTH of the fade in from where cover begins, the fade as it is at that spot
         constexpr float MIN_TARGET = 0.05F;
+        const float openShare = inTheOpen(open, covered, slope);
+        const RE::NiPoint3 dripLine = positions[open] + ((positions[covered] - positions[open]) * openShare);
         const float target
-            = std::clamp(inTheOpen(open, covered, slope) + (K_EDGE_DEPTH * fade.distance / length), MIN_TARGET, 1.0F);
+            = std::clamp(openShare + (K_EDGE_DEPTH * fade.distanceAt(dripLine) / length), MIN_TARGET, 1.0F);
         const float needed = 1.0F - ((1.0F - edgeOpenness) / target);
         if (!stands(covered)) {
             openness[covered] = std::max(openness[covered], std::clamp(needed, 0.0F, 1.0F));

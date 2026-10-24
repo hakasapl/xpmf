@@ -435,6 +435,8 @@ void ConfigLoader::loadConfig()
             profile.roofShelterFixVertices
                 = fields.boolean("roofShelterFixVertices", DEFAULT_ROOF_SHELTER_FIX_VERTICES);
             profile.shelterFade = fields.number("shelterFade", 0.0F, MAX_SHELTER_FADE, DEFAULT_SHELTER_FADE);
+            profile.shelterRandomness
+                = fields.number("shelterRandomness", 0.0F, MAX_SHELTER_RANDOMNESS, DEFAULT_SHELTER_RANDOMNESS);
             // The mesh's specular on the shapes the projection is on (ProjectedGeometry)
             profile.specularMult = fields.optionalNumberBetween("specularMult", 0.0, MAX_SPECULAR_MULT);
             // An editor's pointer to schema/profile.schema.json, and a note
@@ -541,6 +543,7 @@ void ConfigLoader::loadConfig()
         spdlog::info(
             "Config Loaded: [{}] Roof Shelter Fix Vertices: {}", profile.name, profile.roofShelterFixVertices);
         spdlog::info("Config Loaded: [{}] Shelter Fade: {}", profile.name, profile.shelterFade);
+        spdlog::info("Config Loaded: [{}] Shelter Randomness: {}", profile.name, profile.shelterRandomness);
         spdlog::info("Config Loaded: [{}] Specular Mult: {}",
                      profile.name,
                      profile.specularMult.has_value() ? std::format("{}", *profile.specularMult)
@@ -600,6 +603,7 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     snow.roofShelter = DEFAULT_ROOF_SHELTER;
     snow.roofShelterFixVertices = DEFAULT_ROOF_SHELTER_FIX_VERTICES;
     snow.shelterFade = DEFAULT_SHELTER_FADE;
+    snow.shelterRandomness = DEFAULT_SHELTER_RANDOMNESS;
 
     // Ash falls like snow and lies like snow, so it gets everything snow gets
     Profile ash = snow;

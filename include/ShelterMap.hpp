@@ -125,14 +125,47 @@ public:
     struct Fade {
         float distance {}; /**< World units under cover over which openness falls to 0; 0 is a hard edge */
         float power {1.0F}; /**< What the plain falloff is raised to; 1 leaves it plain */
+        float edgeThrow {}; /**< The profile's shelterRandomness: world units the snow's edge swings in and out by
+                            at most (distanceAt); 0 keeps it where the fade puts it */
 
         /**
          * @param distance The profile's shelterFade
          * @param edgeOpenness Openness at which snow visibly ends on a flat surface of the material
+         * @param edgeThrow The profile's shelterRandomness
          */
         [[nodiscard]] static auto of(float distance,
-                                     float edgeOpenness) -> Fade;
+                                     float edgeOpenness,
+                                     float edgeThrow = 0.0F) -> Fade;
+
+        /**
+         * @brief The distance at a spot, swung by swing() there so that the snow's edge lies up to
+         * edgeThrow deeper or shallower than K_EDGE_DEPTH of the distance
+         *
+         * Wind does not carry snow in under an eave evenly, and a snow line at one depth all along
+         * a roof reads as a ruler's edge. So the distance the snow fades over swings in and out
+         * along the eave, and with it the depth the snow's edge lies at, which is K_EDGE_DEPTH of
+         * it: by twice the throw, for the edge to move by the throw. Inwards that is all; outwards
+         * the edge cannot pass the drip line (nothing in the open is touched), so a swing that
+         * takes it below half its usual depth eases it towards the drip line instead, and a
+         * large throw rounds the wave off short of it rather than running it flat along the eave.
+         */
+        [[nodiscard]] auto distanceAt(const RE::NiPoint3& point) const -> float;
     };
+
+    /**
+     * @brief Smooth noise over the ground, -1..1, the same at a spot for every shape and every
+     * load: what Fade::distanceAt swings the fade by
+     *
+     * Two octaves of gradient noise in world x and y, K_SWING_WAVELENGTH and a little under half
+     * of it: a bay of snow reaching in or a stretch held back every hundred units or so along an
+     * eave, with smaller bends on top, each wave as deep as its own bump - the deepest close to
+     * 1, none held flat at it. Height plays no part, so the floors under one roof swing alike.
+     */
+    [[nodiscard]] static auto swing(float x,
+                                    float y) -> float;
+
+    constexpr static float K_SWING_WAVELENGTH = 128.0F; /**< World units of the swing's main octave; 256 waved
+                                                           too seldom in game */
 
     /**
      * @brief The 3x3 block of finished maps around a cell, immutable and safe to read on the worker

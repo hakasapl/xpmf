@@ -1429,6 +1429,7 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
              .noiseAmplitude = noiseAmplitude,
              .meanNoise = treatment->meanNoise,
              .fade = treatment->profile->shelterFade,
+             .randomness = treatment->profile->shelterRandomness,
              .isSnow = isSnow,
              .alphaTest = shape->alphaTest != nullptr,
              .alphaThreshold
@@ -1908,7 +1909,11 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
                      1.0F - EDGE_MARGIN);
     // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
     // that one shelterFade ends the snow as far in on this material as on any other
-    const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
+    const ShelterMap::Fade straight = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
+    // ...and the same with the snow's edge swinging in and out along the eave (shelterRandomness):
+    // what the roof shelter's openness is read with, once the vertex fix has decided where its
+    // vertices go by the straight one - the swing adds none
+    const ShelterMap::Fade swinging = ShelterMap::Fade::of(receiver.fade, edgeOpenness, receiver.randomness);
     // How far a vertex's color is whitened for its snow, as far as the cover goes: fully where
     // the snow is visibly there, at the edge openness and above, and less as the cover takes it,
     // down to the mesh's own color where it is gone
@@ -1938,7 +1943,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     bool colorCover = false; // colorsOnly, and something stands over the shape
     if (shelter || colorsOnly) {
         worldPositions(receiver, *layout, positions);
-        bool anyCover = field.initialOpenness(positions, normals, fade, openness);
+        bool anyCover = field.initialOpenness(positions, normals, straight, openness);
         measured.clear();
 
         if (shelter && lead != nullptr) {
@@ -1977,7 +1982,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
                             normals.push_back(normal);
                             slope = ShelterMap::Slope::of(normal);
                         }
-                        openness.push_back(field.opennessAt(positions.back(), slope, fade));
+                        openness.push_back(field.opennessAt(positions.back(), slope, straight));
                     }
                     measured.assign(positions.size(), false);
                     for (std::uint32_t index = 0; index < vertexCount; ++index) {
@@ -2027,7 +2032,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
                                                        measured,
                                                        indices,
                                                        holdsSnowFrom,
-                                                       fade,
+                                                       straight,
                                                        refinementLimits(vertexCount));
                 if (refinement.has_value()) {
                     indices = refinement->indices;
@@ -2039,11 +2044,18 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
         }
 
         if (anyCover) {
+            // The roof shelter's edge swings along the eave: every vertex, the vertex fix's
+            // included, read again on the swinging fade, where it stands. Which vertices are
+            // covered at all does not change with it
+            const bool swings = shelter && receiver.randomness > 0.0F;
+            if (swings) {
+                (void)field.initialOpenness(positions, normals, swinging, openness);
+            }
             // What the vertex fix tested stands as measured: left to the settling, a floor's
             // rim would be pulled down to mend the middle of triangles that are no longer
             // there, and a hard edge left along it. The settling is for the rest - what was
             // too narrow or too small to test, and every shape the fix is not for
-            field.settleOpenness(positions, indices, fade, edgeOpenness, measured, openness);
+            field.settleOpenness(positions, indices, swings ? swinging : straight, edgeOpenness, measured, openness);
             facing.resize(positions.size());
             for (std::size_t index = 0; index < positions.size(); ++index) {
                 facing[index] = layout->hasNormals ? normals[index].z : 1.0F;

@@ -51,7 +51,7 @@ public:
      * The settings fall into the plugin's three independent parts - patching the material (the
      * four textures, the three falloff values, maxAngle and the LOD materials, each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
-     * shelterFade and roofShelterFixVertices) - and any combination
+     * shelterFade, shelterRandomness and roofShelterFixVertices) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
      * over the EditorIDs of the statics (base records) it is not applied to. A fourth, specularMult,
      * scales the specular strength of the shapes the projection is on.
@@ -127,6 +127,9 @@ public:
                                            of long planks) follows the drip line all the same
                                            (ShelterRefinement); only ever with roofShelter */
         float shelterFade {}; /**< World units over which it fades out under cover */
+        float shelterRandomness {}; /**< World units the snow's edge under cover swings in and out along an eave at
+                                       most, in waves of random depth (ShelterMap::Fade::distanceAt): 0 keeps it a
+                                       straight line half way through the fade; never out past the drip line */
         std::optional<float> specularMult; /**< What the specular strength of every shape the projection is on
                                               is multiplied by, on a copy of the shape's material: 0 takes the
                                               highlight off, 1 leaves it. The shader lights covered pixels with
@@ -264,6 +267,9 @@ private:
     constexpr static bool DEFAULT_ROOF_SHELTER = true;
     constexpr static bool DEFAULT_ROOF_SHELTER_FIX_VERTICES = true; /**< Game meshes are coarse where it counts */
     constexpr static float DEFAULT_SHELTER_FADE = 64.0F; /**< About how far wind carries snow in under an eave */
+    constexpr static float DEFAULT_SHELTER_RANDOMNESS = 32.0F; /**< Wind does not carry snow in evenly: with the
+                                                                  default fade, from the drip line to its far end */
+    constexpr static float MAX_SHELTER_RANDOMNESS = 128.0F; /**< As far in as the fade itself goes */
     constexpr static double MAX_ANGLE_LIMIT = 180.0; /**< cos(angle) is what the shader compares with; at 180 every
                                                         face is covered and past it there is nothing to say */
     constexpr static double MAX_SPECULAR_MULT = 10.0; /**< Ten times a mesh's own specular is as far as it goes */
