@@ -56,6 +56,7 @@ set(headers
     "include/Text.hpp"
     "include/TextureColor.hpp"
     "include/VertexLayout.hpp"
+    "include/WaterMask.hpp"
 )
 
 set(sources
@@ -75,6 +76,7 @@ set(sources
     "src/ShelterRefinement.cpp"
     "src/ShelterTwins.cpp"
     "src/TextureColor.cpp"
+    "src/WaterMask.cpp"
 )
 
 add_library(${PROJECT_NAME} SHARED ${headers} ${sources})

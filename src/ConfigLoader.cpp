@@ -437,6 +437,10 @@ void ConfigLoader::loadConfig()
             profile.shelterFade = fields.number("shelterFade", 0.0F, MAX_SHELTER_FADE, DEFAULT_SHELTER_FADE);
             profile.shelterRandomness
                 = fields.number("shelterRandomness", 0.0F, MAX_SHELTER_RANDOMNESS, DEFAULT_SHELTER_RANDOMNESS);
+            // One more thing the vertex alpha keeps the projection off, on its own: water (WaterMask)
+            profile.waterFade = fields.boolean("waterFade", DEFAULT_WATER_FADE);
+            profile.waterFadeRandomness
+                = fields.number("waterFadeRandomness", 0.0F, MAX_WATER_FADE_RANDOMNESS, DEFAULT_WATER_FADE_RANDOMNESS);
             // The mesh's specular on the shapes the projection is on (ProjectedGeometry)
             profile.specularMult = fields.optionalNumberBetween("specularMult", 0.0, MAX_SPECULAR_MULT);
             // An editor's pointer to schema/profile.schema.json, and a note
@@ -544,6 +548,8 @@ void ConfigLoader::loadConfig()
             "Config Loaded: [{}] Roof Shelter Fix Vertices: {}", profile.name, profile.roofShelterFixVertices);
         spdlog::info("Config Loaded: [{}] Shelter Fade: {}", profile.name, profile.shelterFade);
         spdlog::info("Config Loaded: [{}] Shelter Randomness: {}", profile.name, profile.shelterRandomness);
+        spdlog::info("Config Loaded: [{}] Water Fade: {}", profile.name, profile.waterFade);
+        spdlog::info("Config Loaded: [{}] Water Fade Randomness: {}", profile.name, profile.waterFadeRandomness);
         spdlog::info("Config Loaded: [{}] Specular Mult: {}",
                      profile.name,
                      profile.specularMult.has_value() ? std::format("{}", *profile.specularMult)
@@ -561,7 +567,8 @@ auto ConfigLoader::isAnyMaterialPatched() -> bool
 auto ConfigLoader::isAnyGeometryChanged() -> bool
 {
     return std::ranges::any_of(s_profiles, [](const Profile& profile) -> bool {
-        return profile.neutralizeVertexColors || profile.neutralizeVertexAlpha || profile.roofShelter;
+        return profile.neutralizeVertexColors || profile.neutralizeVertexAlpha || profile.roofShelter
+            || profile.waterFade;
     });
 }
 
@@ -579,6 +586,8 @@ auto ConfigLoader::isAnyCoverMeasured() -> bool
         return profile.roofShelter || profile.neutralizeVertexColors;
     });
 }
+
+auto ConfigLoader::isAnyWaterFaded() -> bool { return std::ranges::any_of(s_profiles, &Profile::waterFade); }
 
 auto ConfigLoader::isAnyLodMaterialNamed() -> bool
 {
@@ -604,6 +613,7 @@ auto ConfigLoader::builtInProfiles() -> std::vector<Profile>
     snow.roofShelterFixVertices = DEFAULT_ROOF_SHELTER_FIX_VERTICES;
     snow.shelterFade = DEFAULT_SHELTER_FADE;
     snow.shelterRandomness = DEFAULT_SHELTER_RANDOMNESS;
+    snow.waterFadeRandomness = DEFAULT_WATER_FADE_RANDOMNESS;
 
     // Ash falls like snow and lies like snow, so it gets everything snow gets
     Profile ash = snow;

@@ -10,6 +10,7 @@
 #include "ShelterTwins.hpp"
 #include "Text.hpp"
 #include "VertexLayout.hpp"
+#include "WaterMask.hpp"
 
 #include "PCH.h"
 
@@ -147,7 +148,7 @@ void ProjectedGeometry::install()
     if (!isWanted()) {
         spdlog::info(
             "Nothing for the Clone3D hooks to do (no profile has neutralizeVertexColors, neutralizeVertexAlpha, "
-            "roofShelter or specularMult on)");
+            "roofShelter, waterFade or specularMult on)");
         return;
     }
 
@@ -208,14 +209,15 @@ void ProjectedGeometry::onMaterialsReady(Materials materials,
     for (const auto& profile : ConfigLoader::getProfiles()) {
         spdlog::info(
             "Geometry pass: profile '{}' has {} material objects (vertex colors: {}, neutralize vertex alpha: {}, "
-            "roof shelter: {}, roof shelter fix vertices: {})",
+            "roof shelter: {}, roof shelter fix vertices: {}, water fade: {})",
             profile.name,
             std::ranges::count_if(s_materials,
                                   [&](const auto& item) -> bool { return item.second.profile == &profile; }),
             profile.neutralizeVertexColors,
             profile.neutralizeVertexAlpha,
             profile.roofShelter,
-            profile.roofShelter && profile.roofShelterFixVertices);
+            profile.roofShelter && profile.roofShelterFixVertices,
+            profile.waterFade);
     }
 }
 
@@ -239,7 +241,7 @@ auto ProjectedGeometry::withGeometry(const Treatment& treatment) -> const Treatm
     // A profile with all of its clone-side settings off wants its statics left alone
     const auto& profile = *treatment.profile;
     const bool wanted = profile.neutralizeVertexColors || profile.neutralizeVertexAlpha || profile.roofShelter
-        || profile.specularMult.has_value();
+        || profile.specularMult.has_value() || profile.waterFade;
     return wanted ? &treatment : nullptr;
 }
 
@@ -258,7 +260,8 @@ auto ProjectedGeometry::settingsOf(const Treatment& treatment,
             .shelter = shelter,
             .coverColors = neutralizeColors && !profile.roofShelter,
             .fixVertices = shelter && profile.roofShelterFixVertices,
-            .specularMult = profile.specularMult};
+            .specularMult = profile.specularMult,
+            .water = profile.waterFade};
 }
 
 void ProjectedGeometry::findKept()
@@ -995,7 +998,7 @@ void ProjectedGeometry::drainResults()
                     const CellKey target = keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1);
                     auto& layer = raster->layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
                     if (layer == nullptr) {
-                        removeLayer(target, raster->source);
+                        removeLayer(s_covers, target, raster->source);
                         continue;
                     }
                     if (!s_cells.contains(target)) {
@@ -1018,6 +1021,26 @@ void ProjectedGeometry::drainResults()
                     auto& kept = cover.layers[raster->source];
                     if (kept != nullptr && *kept == *layer) {
                         ++s_sameLayers;
+                        continue;
+                    }
+                    kept = std::move(layer);
+                    rebuildMap(cover);
+                }
+            }
+            // The water it put over the same cells, the same way: kept for cells not loaded, and
+            // left as it lay where it came back the same
+            for (int slotY = 0; slotY < ShelterMap::K_BLOCK; ++slotY) {
+                for (int slotX = 0; slotX < ShelterMap::K_BLOCK; ++slotX) {
+                    const CellKey target = keyOf(raster->cellX + slotX - 1, raster->cellY + slotY - 1);
+                    auto& layer
+                        = raster->waterLayers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
+                    if (layer == nullptr) {
+                        removeLayer(s_waterCovers, target, raster->source);
+                        continue;
+                    }
+                    Cover& cover = s_waterCovers[target];
+                    auto& kept = cover.layers[raster->source];
+                    if (kept != nullptr && *kept == *layer) {
                         continue;
                     }
                     kept = std::move(layer);
@@ -1158,23 +1181,26 @@ void ProjectedGeometry::dropCell(CellKey key)
     retire(found->second.receivers);
     s_cells.erase(found);
 
-    // What its statics put over the cells around it, and over its own, goes with it
+    // What its statics put over the cells around it, and over its own, goes with it, and so does
+    // its water
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-            removeLayer(keyOf(cellX + offsetX, cellY + offsetY), key);
+            removeLayer(s_covers, keyOf(cellX + offsetX, cellY + offsetY), key);
+            removeLayer(s_waterCovers, keyOf(cellX + offsetX, cellY + offsetY), key);
         }
     }
 }
 
-void ProjectedGeometry::removeLayer(CellKey target,
+void ProjectedGeometry::removeLayer(Covers& covers,
+                                    CellKey target,
                                     CellKey source)
 {
-    const auto cover = s_covers.find(target);
-    if (cover == s_covers.end() || cover->second.layers.erase(source) == 0) {
+    const auto cover = covers.find(target);
+    if (cover == covers.end() || cover->second.layers.erase(source) == 0) {
         return; // had nothing there
     }
     if (cover->second.layers.empty()) {
-        s_covers.erase(cover);
+        covers.erase(cover);
     } else {
         rebuildMap(cover->second);
     }
@@ -1314,11 +1340,14 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         return;
     }
     // Buildings, rocks and their kin shelter; trees shelter nothing worth the name. A container
-    // matters only as something Seasons of Skyrim snows on
+    // matters only as something Seasons of Skyrim snows on, placed water - an activator with a
+    // water type: a river, a pond - only as what it puts over the cells around it, where a
+    // profile keeps its projection out of water
     const auto formType = base->GetFormType();
     const bool mayShelter = formType == RE::FormType::Static || formType == RE::FormType::MovableStatic
         || formType == RE::FormType::StaticCollection;
-    if (!mayShelter && (s_winterSnow == nullptr || formType != RE::FormType::Container)) {
+    const bool water = formType == RE::FormType::Activator && base->IsWater() && ConfigLoader::isAnyWaterFaded();
+    if (!mayShelter && !water && (s_winterSnow == nullptr || formType != RE::FormType::Container)) {
         return;
     }
     auto* const root = ref.Get3D();
@@ -1332,6 +1361,10 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
     if (root->world.translate.GetSquaredDistance(ref.GetPosition()) > READY_TOLERANCE_SQ
         && root->world.translate.GetSquaredDistance(root->local.translate) > READY_TOLERANCE_SQ) {
         gather.unready = true;
+        return;
+    }
+    if (water) {
+        collectWater(*root);
         return;
     }
 
@@ -1397,7 +1430,9 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         // the game's projected diffuse, on top of the blood
         const bool everProjected
             = shape->shader->flags.any(ShaderFlag::kProjectedUV) || s_switchedOff.contains(shape->shape);
-        const bool receives = snowed && (colorsEnabled || settings.shelter) && everProjected;
+        // ...and one whose colors were never shown is one too where its profile keeps the
+        // projection out of water, which may take its alpha as the roof shelter would
+        const bool receives = snowed && (colorsEnabled || settings.shelter || settings.water) && everProjected;
         if (!receives) {
             return;
         }
@@ -1438,7 +1473,56 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
              .reference = ref.GetFormID(),
              .decal = shape->shader->flags.any(ShaderFlag::kDecal, ShaderFlag::kDynamicDecal),
              .coverColors = settings.coverColors,
-             .plainTriShape = shape->refinable});
+             .plainTriShape = shape->refinable,
+             .water = settings.water,
+             .waterRandomness = treatment->profile->waterFadeRandomness});
+    });
+}
+
+void ProjectedGeometry::collectWater(RE::NiAVObject& root)
+{
+    Gather& gather = *s_gather;
+    forEachLeaf(root, K_MAX_NODES_PER_REF, true, [&](RE::NiAVObject& object) -> void {
+        // The water itself is what the engine hands its water system: every shape under such a
+        // reference's 3D that has a water shader (TESWaterSystem::AddWater). A flat plane mostly,
+        // a stream's surface down its bed sometimes; rasterized either way, so either is right
+        auto* const shape = object.AsTriShape();
+        if (shape == nullptr || shape->GetType().get() != RE::BSGeometry::Type::kTriShape) {
+            return;
+        }
+        const auto& geometry = shape->GetGeometryRuntimeData();
+        if (netimmerse_cast<RE::BSWaterShaderProperty*>(geometry.shaderProperty.get()) == nullptr
+            || geometry.skinInstance != nullptr) {
+            return;
+        }
+        auto* const data = geometry.rendererData;
+        const auto layout = data != nullptr ? VertexLayout::from(data->vertexDesc) : std::nullopt;
+        const auto& counts = shape->GetTrishapeRuntimeData();
+        if (!layout.has_value() || data->rawVertexData == nullptr || data->rawIndexData == nullptr
+            || counts.vertexCount == 0 || counts.triangleCount == 0) {
+            static std::atomic<bool> loggedUnreadable {false};
+            if (!loggedUnreadable.exchange(true)) {
+                spdlog::warn("Placed water shape '{}' keeps no copy of its triangles this plugin can read, so "
+                             "waterFade does not see it. This was the first such shape",
+                             shape->name.empty() ? "(unnamed)" : shape->name.c_str());
+            }
+            return;
+        }
+        ProjectedVertexData::addRef(data);
+        gather.waters.push_back({.keepAlive = RE::NiPointer<RE::BSTriShape> {shape},
+                                 .pinned = data,
+                                 .vertexCount = counts.vertexCount,
+                                 .triangleCount = counts.triangleCount,
+                                 .layout = *layout,
+                                 .world = shape->world});
+        static std::atomic<bool> loggedFirst {false};
+        if (!loggedFirst.exchange(true)) {
+            spdlog::info("waterFade: the first placed water surface was gathered: shape '{}' of {} triangles at "
+                         "a height of {}",
+                         shape->name.empty() ? "(unnamed)" : shape->name.c_str(),
+                         static_cast<std::uint32_t>(counts.triangleCount),
+                         shape->world.translate.z);
+        }
     });
 }
 
@@ -1490,7 +1574,7 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     }
     cell.receiversSince = now;
 
-    if (!ConfigLoader::isAnyCoverMeasured()) {
+    if (!ConfigLoader::isAnyCoverMeasured() && !ConfigLoader::isAnyWaterFaded()) {
         return; // nothing was gathered to rasterize
     }
     cell.rasterInFlight = true;
@@ -1498,7 +1582,8 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
                       .cellX = gather.cellX,
                       .cellY = gather.cellY,
                       .epoch = cell.epoch,
-                      .occluders = std::move(gather.occluders)});
+                      .occluders = std::move(gather.occluders),
+                      .waters = std::move(gather.waters)});
 }
 
 auto ProjectedGeometry::fieldStamp(const Cell& cell) -> std::uint64_t
@@ -1513,7 +1598,56 @@ auto ProjectedGeometry::fieldStamp(const Cell& cell) -> std::uint64_t
             stamp = hashMix(stamp, cover != s_covers.end() ? cover->second.version : 0);
         }
     }
+    // ...and of the water over them, where there is any: no two maps share a version, and a cell
+    // with no water about keeps the stamp it always had
+    for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            if (const auto water = s_waterCovers.find(keyOf(cell.cellX + offsetX, cell.cellY + offsetY));
+                water != s_waterCovers.end()) {
+                stamp = hashMix(stamp, water->second.version);
+            }
+        }
+    }
     return stamp != 0 ? stamp : 1; // 0 is "never computed"
+}
+
+void ProjectedGeometry::fillWater(const Cell& cell,
+                                  WaterMask::Water& water)
+{
+    // The placed water over the 3x3 cells, and each cell's own level - read from the cell, for a
+    // loaded one; one that is not is taken to have the middle cell's
+    const auto levelOf = [](CellKey key) -> std::optional<float> {
+        const auto found = s_cells.find(key);
+        const auto* const form
+            = found != s_cells.end() ? RE::TESForm::LookupByID<RE::TESObjectCELL>(found->second.formId) : nullptr;
+        if (form == nullptr) {
+            return std::nullopt;
+        }
+        return std::max(form->GetExteriorWaterHeight(), ShelterMap::K_NOTHING); // no water: minus infinity
+    };
+    water.placed.centerX = cell.cellX;
+    water.placed.centerY = cell.cellY;
+    const float middle = levelOf(keyOf(cell.cellX, cell.cellY)).value_or(ShelterMap::K_NOTHING);
+    for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const CellKey key = keyOf(cell.cellX + offsetX, cell.cellY + offsetY);
+            const auto slot = static_cast<std::size_t>(((offsetY + 1) * ShelterMap::K_BLOCK) + offsetX + 1);
+            if (const auto cover = s_waterCovers.find(key); cover != s_waterCovers.end()) {
+                water.placed.maps.at(slot) = cover->second.map;
+            }
+            water.levels.at(slot) = levelOf(key).value_or(middle);
+        }
+    }
+
+    static bool loggedLevel = false; // main thread
+    if (!loggedLevel && middle > ShelterMap::K_NOTHING) {
+        loggedLevel = true;
+        spdlog::info("waterFade: cell {}, {} has its own water at a height of {}; this was the first cell judged "
+                     "with any",
+                     cell.cellX,
+                     cell.cellY,
+                     middle);
+    }
 }
 
 auto ProjectedGeometry::neighborhoodBusy(const Cell& cell) -> bool
@@ -1569,6 +1703,9 @@ void ProjectedGeometry::scheduleReceivers(Clock::time_point now)
                         = cover->second.map;
                 }
             }
+        }
+        if (ConfigLoader::isAnyWaterFaded()) {
+            fillWater(cell, job.water);
         }
         job.receivers = std::move(cell.receivers);
         cell.receivers.clear();
@@ -1664,36 +1801,48 @@ void ProjectedGeometry::workerLoop()
 
 auto ProjectedGeometry::run(RasterJob& job) -> RasterResult
 {
-    std::array<ShelterMap::Layer, ShelterMap::K_BLOCK_CELLS> layers;
-    for (int slotY = 0; slotY < ShelterMap::K_BLOCK; ++slotY) {
-        for (int slotX = 0; slotX < ShelterMap::K_BLOCK; ++slotX) {
-            auto& layer = layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
-            layer.cellX = job.cellX + slotX - 1;
-            layer.cellY = job.cellY + slotY - 1;
-        }
-    }
-
-    std::vector<RE::NiPoint3> world;
-    for (const auto& occluder : job.occluders) {
-        const std::span<const std::uint8_t> vertices {
-            occluder.pinned->rawVertexData, static_cast<std::size_t>(occluder.layout.stride) * occluder.vertexCount};
-        const std::span<const std::uint16_t> indices {occluder.pinned->rawIndexData,
-                                                      static_cast<std::size_t>(occluder.triangleCount) * 3};
-        world.resize(occluder.vertexCount);
-        for (std::uint32_t index = 0; index < occluder.vertexCount; ++index) {
-            world[index] = occluder.world
-                * VertexLayout::position(vertices.subspan(static_cast<std::size_t>(index) * occluder.layout.stride,
-                                                          occluder.layout.stride));
-        }
-        for (std::size_t corner = 0; corner + 2 < indices.size(); corner += 3) {
-            const std::uint16_t first = indices[corner];
-            const std::uint16_t second = indices[corner + 1];
-            const std::uint16_t third = indices[corner + 2];
-            if (first < occluder.vertexCount && second < occluder.vertexCount && third < occluder.vertexCount) {
-                ShelterMap::rasterize(layers, world[first], world[second], world[third]);
+    using Layers = std::array<ShelterMap::Layer, ShelterMap::K_BLOCK_CELLS>;
+    const auto emptyLayers = [&]() -> Layers {
+        Layers layers;
+        for (int slotY = 0; slotY < ShelterMap::K_BLOCK; ++slotY) {
+            for (int slotX = 0; slotX < ShelterMap::K_BLOCK; ++slotX) {
+                auto& layer = layers.at(static_cast<std::size_t>((slotY * ShelterMap::K_BLOCK) + slotX));
+                layer.cellX = job.cellX + slotX - 1;
+                layer.cellY = job.cellY + slotY - 1;
             }
         }
-    }
+        return layers;
+    };
+
+    // The roofs, and the tops of the placed water in layers of their own, the same way
+    std::vector<RE::NiPoint3> world;
+    const auto rasterize = [&](const std::vector<Occluder>& occluders, Layers& layers) -> void {
+        for (const auto& occluder : occluders) {
+            const std::span<const std::uint8_t> vertices {occluder.pinned->rawVertexData,
+                                                          static_cast<std::size_t>(occluder.layout.stride)
+                                                              * occluder.vertexCount};
+            const std::span<const std::uint16_t> indices {occluder.pinned->rawIndexData,
+                                                          static_cast<std::size_t>(occluder.triangleCount) * 3};
+            world.resize(occluder.vertexCount);
+            for (std::uint32_t index = 0; index < occluder.vertexCount; ++index) {
+                world[index] = occluder.world
+                    * VertexLayout::position(vertices.subspan(static_cast<std::size_t>(index) * occluder.layout.stride,
+                                                              occluder.layout.stride));
+            }
+            for (std::size_t corner = 0; corner + 2 < indices.size(); corner += 3) {
+                const std::uint16_t first = indices[corner];
+                const std::uint16_t second = indices[corner + 1];
+                const std::uint16_t third = indices[corner + 2];
+                if (first < occluder.vertexCount && second < occluder.vertexCount && third < occluder.vertexCount) {
+                    ShelterMap::rasterize(layers, world[first], world[second], world[third]);
+                }
+            }
+        }
+    };
+    Layers layers = emptyLayers();
+    rasterize(job.occluders, layers);
+    Layers waterLayers = emptyLayers();
+    rasterize(job.waters, waterLayers);
 
     RasterResult result;
     result.source = job.source;
@@ -1704,8 +1853,13 @@ auto ProjectedGeometry::run(RasterJob& job) -> RasterResult
         if (!layers.at(slot).top.empty()) {
             result.layers.at(slot) = std::make_shared<const ShelterMap::Heights>(std::move(layers.at(slot).top));
         }
+        if (!waterLayers.at(slot).top.empty()) {
+            result.waterLayers.at(slot)
+                = std::make_shared<const ShelterMap::Heights>(std::move(waterLayers.at(slot).top));
+        }
     }
     result.retired = std::move(job.occluders);
+    std::ranges::move(job.waters, std::back_inserter(result.retired));
     return result;
 }
 
@@ -1764,6 +1918,22 @@ auto unitOf(const RE::NiPoint3& vector) -> RE::NiPoint3
     const float length = vector.Length();
     constexpr float MIN_LENGTH = 1.0e-6F;
     return length > MIN_LENGTH ? vector * (1.0F / length) : vector;
+}
+
+/**
+ * @brief Says in the log, once, the first shape the water took projection off: whoever checks
+ * that a profile's waterFade is at work finds it there; worker thread
+ */
+void logFirstUnderWater(const RE::BSTriShape* shape,
+                        RE::FormID reference)
+{
+    static std::atomic<bool> logged {false};
+    if (!logged.exchange(true)) {
+        spdlog::info("waterFade: shape '{}' of reference {:08X} reaches into water and loses the projection "
+                     "there. This was the first such shape",
+                     shape != nullptr && !shape->name.empty() ? shape->name.c_str() : "(unnamed)",
+                     reference);
+    }
 }
 
 } // namespace
@@ -1840,6 +2010,7 @@ auto ProjectedGeometry::twinGroups(const std::vector<Receiver>& receivers) -> st
 }
 
 auto ProjectedGeometry::judge(const ShelterMap::Field& field,
+                              const WaterMask::Water* water,
                               const Receiver& receiver,
                               Scratch& scratch,
                               bool mayRefine,
@@ -1941,6 +2112,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     // the projection there staying as it is
     const bool colorsOnly = !shelter && receiver.coverColors && receiver.shape.colorsEnabled;
     bool colorCover = false; // colorsOnly, and something stands over the shape
+    bool tallied = false; // whether anything takes projection off a vertex, and the openness is to be judged
     if (shelter || colorsOnly) {
         worldPositions(receiver, *layout, positions);
         bool anyCover = field.initialOpenness(positions, normals, straight, openness);
@@ -2056,18 +2228,50 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
             // there, and a hard edge left along it. The settling is for the rest - what was
             // too narrow or too small to test, and every shape the fix is not for
             field.settleOpenness(positions, indices, swings ? swinging : straight, edgeOpenness, measured, openness);
-            facing.resize(positions.size());
-            for (std::size_t index = 0; index < positions.size(); ++index) {
-                facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
-            }
             if (shelter) {
-                verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
-                                            !receiver.shape.keepAlpha);
+                tallied = true;
             } else {
                 colorCover = true;
             }
         }
     }
+
+    // The colors' own cover takes no snow away: it is set apart, and what the projection goes by
+    // starts in the open
+    auto& coverOpenness = scratch.coverOpenness;
+    if (colorCover) {
+        coverOpenness = openness;
+        openness.assign(positions.size(), 1.0F);
+    }
+
+    // Water over the shape takes the projection off as well, by itself: a vertex keeps the lesser
+    // of what it and the roofs leave it. The water is smooth across the triangles, and the
+    // settling, which is for the roofs' drip lines, is not for it
+    if (water != nullptr) {
+        if (!shelter && !colorsOnly) {
+            worldPositions(receiver, *layout, positions);
+            openness.assign(positions.size(), 1.0F);
+        }
+        if (WaterMask::apply(*water, positions, edgeOpenness, receiver.waterRandomness, openness)) {
+            tallied = true;
+            logFirstUnderWater(receiver.keepAlive.get(), receiver.reference);
+        }
+    }
+    if (tallied || colorCover) {
+        facing.resize(positions.size());
+        for (std::size_t index = 0; index < positions.size(); ++index) {
+            facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
+        }
+    }
+    if (tallied) {
+        verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
+                                    !receiver.shape.keepAlpha);
+    }
+    // How far in the open a vertex is for its color: the projection's openness, and where the
+    // colors measure cover of their own, the lesser of the two
+    const auto colorOpenness = [&](std::size_t index) -> float {
+        return colorCover ? std::min(coverOpenness[index], openness[index]) : openness[index];
+    };
 
     // What the shape is to draw. A private variant it already draws, to the same values, stays
     // (the fingerprint); a refined topology the shape leads with is handed on only once it is
@@ -2084,10 +2288,10 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     // changes nothing on a vertex the shared variant leaves the mesh's colors already, facing
     // away from the snow
     bool coverChanges = false;
-    if (colorCover) {
+    if (colorCover && verdict == ShelterMap::Verdict::OPEN) {
         cover.resize(vertexCount);
         for (std::uint32_t index = 0; index < vertexCount; ++index) {
-            cover[index] = coverOf(openness[index]);
+            cover[index] = coverOf(colorOpenness(index));
             coverChanges = coverChanges
                 || (cover[index] < VertexLayout::COLOR_MAX
                     && ProjectedVertexData::whitenWeight(facing[index], receiver.shape.snowFrom) > 0.0F);
@@ -2153,7 +2357,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
         for (std::size_t index = 0; index < total; ++index) {
             const float gone = goneAlpha(facing[index]);
             values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
-            cover[index] = coverOf(openness[index]);
+            cover[index] = coverOf(colorOpenness(index));
         }
         if (receiver.alphaTest) {
             // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
@@ -2259,6 +2463,12 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
         judgement = Judgement {};
     };
 
+    // The water a receiver is judged against besides its cover, where its profile keeps the
+    // projection out of it
+    const auto waterOf = [&](std::size_t index) -> const WaterMask::Water* {
+        return job.receivers[index].water ? &job.water : nullptr;
+    };
+
     // Shapes that draw one another's triangles are judged as one: the leader first, then its
     // twins cut like it (ShelterTwins). A twin that cannot be, this time round, holds the leader
     // back to the model's triangles too, so that the two never disagree
@@ -2270,11 +2480,13 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             grouped[follower] = true;
         }
         Lead lead;
-        Judgement leaderJudgement = judge(job.field, job.receivers[twins.leader], scratch, !twins.held, nullptr, &lead);
+        Judgement leaderJudgement = judge(
+            job.field, waterOf(twins.leader), job.receivers[twins.leader], scratch, !twins.held, nullptr, &lead);
         judgements.clear();
         bool failed = false;
         for (const std::size_t follower : twins.followers) {
             judgements.push_back(judge(job.field,
+                                       waterOf(follower),
                                        job.receivers[follower],
                                        scratch,
                                        false,
@@ -2287,10 +2499,12 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
             for (Judgement& judgement : judgements) {
                 discard(judgement);
             }
-            leaderJudgement = judge(job.field, job.receivers[twins.leader], scratch, false, nullptr, nullptr);
+            leaderJudgement = judge(
+                job.field, waterOf(twins.leader), job.receivers[twins.leader], scratch, false, nullptr, nullptr);
             judgements.clear();
             for (const std::size_t follower : twins.followers) {
-                judgements.push_back(judge(job.field, job.receivers[follower], scratch, false, nullptr, nullptr));
+                judgements.push_back(
+                    judge(job.field, waterOf(follower), job.receivers[follower], scratch, false, nullptr, nullptr));
             }
             result.unmet = true;
         }
@@ -2337,7 +2551,7 @@ auto ProjectedGeometry::run(ReceiverJob& job) -> ReceiverResult
         if (grouped[index]) {
             continue;
         }
-        Judgement judgement = judge(job.field, job.receivers[index], scratch, true, nullptr, nullptr);
+        Judgement judgement = judge(job.field, waterOf(index), job.receivers[index], scratch, true, nullptr, nullptr);
         commit(job.receivers[index], judgement);
     }
 

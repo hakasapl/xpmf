@@ -51,7 +51,7 @@ public:
      * The settings fall into the plugin's three independent parts - patching the material (the
      * four textures, the three falloff values, maxAngle and the LOD materials, each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
-     * shelterFade, shelterRandomness and roofShelterFixVertices) - and any combination
+     * shelterFade, shelterRandomness and roofShelterFixVertices, waterFade) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
      * over the EditorIDs of the statics (base records) it is not applied to. A fourth, specularMult,
      * scales the specular strength of the shapes the projection is on.
@@ -130,6 +130,12 @@ public:
         float shelterRandomness {}; /**< World units the snow's edge under cover swings in and out along an eave at
                                        most, in waves of random depth (ShelterMap::Fade::distanceAt): 0 keeps it a
                                        straight line half way through the fade; never out past the drip line */
+        bool waterFade {}; /**< Whether vertex alpha takes the projection off what lies under water - below the
+                                 level of the cell's own water, or under a placed water plane - fading it out across
+                                 the surface (WaterMask) */
+        float waterFadeRandomness {}; /**< World units the projection's edge at a water surface is lifted by at most,
+                                         in waves of random height along the waterline - the roof shelter's noise and
+                                         easing (ShelterMap::swungEdge) - and never lowered under it */
         std::optional<float> specularMult; /**< What the specular strength of every shape the projection is on
                                               is multiplied by, on a copy of the shape's material: 0 takes the
                                               highlight off, 1 leaves it. The shader lights covered pixels with
@@ -215,6 +221,11 @@ public:
     [[nodiscard]] static auto isAnyCoverMeasured() -> bool;
 
     /**
+     * @brief Whether any profile keeps its projection out from under water, i.e. whether placed water is gathered
+     */
+    [[nodiscard]] static auto isAnyWaterFaded() -> bool;
+
+    /**
      * @brief Whether any profile names a LOD material, i.e. whether the object LOD hook is needed
      */
     [[nodiscard]] static auto isAnyLodMaterialNamed() -> bool;
@@ -270,6 +281,10 @@ private:
     constexpr static float DEFAULT_SHELTER_RANDOMNESS = 32.0F; /**< Wind does not carry snow in evenly: with the
                                                                   default fade, from the drip line to its far end */
     constexpr static float MAX_SHELTER_RANDOMNESS = 128.0F; /**< As far in as the fade itself goes */
+    constexpr static bool DEFAULT_WATER_FADE = false; /**< A profile without it looks as it always did */
+    constexpr static float DEFAULT_WATER_FADE_RANDOMNESS = 16.0F; /**< Splash and spray do not reach up evenly */
+    constexpr static float MAX_WATER_FADE_RANDOMNESS = 64.0F; /**< A bare band higher than that above the water is
+                                                                 no waterline any more */
     constexpr static double MAX_ANGLE_LIMIT = 180.0; /**< cos(angle) is what the shader compares with; at 180 every
                                                         face is covered and past it there is nothing to say */
     constexpr static double MAX_SPECULAR_MULT = 10.0; /**< Ten times a mesh's own specular is as far as it goes */

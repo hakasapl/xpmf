@@ -5,6 +5,7 @@
 #include "ShelterMap.hpp"
 #include "ShelterRefinement.hpp"
 #include "VertexLayout.hpp"
+#include "WaterMask.hpp"
 
 #include "PCH.h"
 
@@ -98,6 +99,12 @@ namespace XPMF {
  *    snow tinted as the game has it. So cover is measured, and occluders gathered, whenever a
  *    profile does either.
  *  - Results are applied, and every pinned pointer let go, back on the main thread in batches.
+ *
+ * Water goes through the same vertex alpha, on its own or with the roofs (a profile's
+ * waterFade, WaterMask): the cells' own water levels, and the placed water planes, which a
+ * gather collects next to the roofs and the worker rasterizes into layers of their own. A vertex
+ * keeps the lesser of what the roofs and the water leave it, and its shape is judged on that as
+ * it is on its cover.
  *
  * Exterior cells only: indoors everything is under a roof, and the snow that is there was put
  * there on purpose.
@@ -262,6 +269,8 @@ private:
         bool decal {}; /**< Decal or Dynamic_Decal shader flag: drawn with a depth bias, so a twin of nothing */
         bool coverColors {}; /**< Settings::coverColors: judged for its colors alone, its projection left as it is */
         bool plainTriShape {}; /**< ShapeView::refinable: a triangle list that may be traded for another */
+        bool water {}; /**< Its profile's waterFade: the projection is kept off what of it lies under water */
+        float waterRandomness {}; /**< ...and waterFadeRandomness */
 
         /**
          * @brief Whether two records say the same of one shape: where it stands, what it was given to
@@ -277,12 +286,14 @@ private:
         int cellY {};
         std::uint64_t epoch {};
         std::vector<Occluder> occluders;
+        std::vector<Occluder> waters; /**< The placed water surfaces, when a profile disables water */
     };
 
     struct ReceiverJob {
         CellKey cell {};
         std::uint64_t epoch {};
         ShelterMap::Field field;
+        WaterMask::Water water; /**< Filled in when a profile disables water */
         std::vector<Receiver> receivers;
     };
 
@@ -292,6 +303,8 @@ private:
         int cellY {};
         std::uint64_t epoch {};
         std::array<std::shared_ptr<const ShelterMap::Heights>, ShelterMap::K_BLOCK_CELLS> layers;
+        // The tops of the placed water over the same cells
+        std::array<std::shared_ptr<const ShelterMap::Heights>, ShelterMap::K_BLOCK_CELLS> waterLayers;
         std::vector<Occluder> retired;
     };
 
@@ -367,6 +380,8 @@ private:
         std::uint64_t version {}; /**< Of map; never 0, and no two maps of any cover ever share one */
     };
 
+    using Covers = std::unordered_map<CellKey, Cover>; /**< By the cell covered */
+
     /**
      * @brief The gather in progress (one at a time); main thread only
      */
@@ -378,6 +393,7 @@ private:
         std::size_t next {};
         bool unready {};
         std::vector<Occluder> occluders;
+        std::vector<Occluder> waters; /**< Placed water surfaces, rasterized like the occluders */
         std::vector<Receiver> receivers;
     };
 
@@ -408,6 +424,7 @@ private:
                                 (ShelterRefinement); only ever with shelter */
         std::optional<float> specularMult; /**< What its shapes' specular strength is multiplied by; std::nullopt
                                               leaves it (no skip list: the profile's own value or nothing) */
+        bool water {}; /**< Its shapes lose the projection under water (no skip list either) */
     };
 
     /**
@@ -623,6 +640,12 @@ private:
     [[nodiscard]] static auto advanceGather(Clock::time_point deadline) -> bool;
     static void collectReference(RE::TESObjectREFR& ref);
 
+    /**
+     * @brief Gathers what a placed water reference - an activator with a water type - puts over
+     * the cells around it: its water shaded shapes, for the worker to rasterize like the occluders
+     */
+    static void collectWater(RE::NiAVObject& root);
+
     static void finishGather(Clock::time_point now);
     static void scheduleReceivers(Clock::time_point now);
     static void dropCell(CellKey key);
@@ -630,11 +653,21 @@ private:
     /**
      * @brief Takes what a source cell put over a target cell away again, and the cover with it once
      * nothing is left over that cell
+     *
+     * @param covers The roofs (s_covers) or the water (s_waterCovers)
      */
-    static void removeLayer(CellKey target,
+    static void removeLayer(Covers& covers,
+                            CellKey target,
                             CellKey source);
     static void rebuildMap(Cover& cover);
     [[nodiscard]] static auto fieldStamp(const Cell& cell) -> std::uint64_t;
+
+    /**
+     * @brief The water around a cell, for a receiver job: the placed water's layers and the cells' own levels
+     */
+    static void fillWater(const Cell& cell,
+                          WaterMask::Water& water);
+
     [[nodiscard]] static auto neighborhoodBusy(const Cell& cell) -> bool;
     static void retire(std::vector<Occluder>& occluders);
     static void retire(std::vector<Receiver>& receivers);
@@ -663,6 +696,8 @@ private:
         std::vector<std::uint8_t> values; /**< Per vertex, what the mesh's alpha is scaled by, or becomes */
         std::vector<std::uint8_t> cover; /**< Per vertex, how far in the open it is for its color
                                             (ProjectedVertexData::custom) */
+        std::vector<float> coverOpenness; /**< Per vertex, the cover the colors measure on their own, where the
+                                             profile neutralizes them and shelters nothing */
     };
 
     /**
@@ -706,8 +741,9 @@ private:
     [[nodiscard]] static auto twinGroups(const std::vector<Receiver>& receivers) -> std::vector<TwinGroup>;
 
     /**
-     * @brief Judges one receiver against the field: what it is to draw
+     * @brief Judges one receiver against the field and the water: what it is to draw
      *
+     * @param water The water around its cell; nullptr unless its profile disables water
      * @param mayRefine Whether the vertex fix may be applied to it (its profile's say, and not held
      *        back for a twin's sake); false for a twin, which is cut like its leader instead
      * @param lead The refined shape it is a twin of, whose topology it is to share; nullptr for a
@@ -716,6 +752,7 @@ private:
      *        refined topology
      */
     [[nodiscard]] static auto judge(const ShelterMap::Field& field,
+                                    const WaterMask::Water* water,
                                     const Receiver& receiver,
                                     Scratch& scratch,
                                     bool mayRefine,
@@ -772,7 +809,8 @@ private:
     static inline std::unordered_map<const RE::BSTriShape*, RE::NiPointer<RE::BSTriShape>> s_switchedOff;
     static inline std::unordered_map<CellKey, Cell> s_cells;
     static inline std::uint64_t s_epoch = 0; /**< The last Cell::epoch given out */
-    static inline std::unordered_map<CellKey, Cover> s_covers; /**< By the cell covered, loaded or not */
+    static inline Covers s_covers; /**< By the cell covered, loaded or not */
+    static inline Covers s_waterCovers; /**< The placed water over each cell, alike */
     static inline std::uint64_t s_coverVersion = 0; /**< The last Cover::version given out */
     static inline std::optional<Gather> s_gather;
     static inline std::vector<Occluder> s_retiredOccluders;

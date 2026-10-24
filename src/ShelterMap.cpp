@@ -212,22 +212,41 @@ auto ShelterMap::Fade::distanceAt(const RE::NiPoint3& point) const -> float
     if (edgeThrow <= 0.0F) {
         return distance;
     }
-    // Where the edge would lie here. Swung out towards the drip line it eases off rather than
-    // reaching it: from three quarters of its usual depth it closes on a quarter of it
-    // exponentially, with no kink. The vertex fix puts its outermost row about on the drip line,
-    // so an edge let out that far would be pinned half way out to the next row, flat along the
-    // eave for as long as the wave lasted; eased, the outer bend of a wave is as round as the inner
+    // Where the edge lies here. Swung out towards the drip line it eases off rather than reaching
+    // it: from three quarters of its usual depth towards a quarter of it. The vertex fix puts its
+    // outermost row about on the drip line, so an edge let out that far would be pinned half way
+    // out to the next row, flat along the eave for as long as the wave lasted
     constexpr float KNEE = 0.75F;
     constexpr float FLOOR = 0.25F;
     constexpr float MIN_DISTANCE = 1.0F;
     const float usual = K_EDGE_DEPTH * distance;
-    float edge = usual + (edgeThrow * swing(point.x, point.y));
-    const float knee = KNEE * usual;
-    const float range = (KNEE - FLOOR) * usual;
-    if (edge < knee) {
-        edge = range > 0.0F ? (FLOOR * usual) + (range * std::exp((edge - knee) / range)) : 0.0F;
+    return std::max(swungEdge(point, usual, edgeThrow, KNEE * usual, FLOOR * usual) / K_EDGE_DEPTH, MIN_DISTANCE);
+}
+
+auto ShelterMap::swungEdge(const RE::NiPoint3& point,
+                           float usual,
+                           float edgeThrow,
+                           float knee,
+                           float limit) -> float
+{
+    // Below the knee the edge closes on the limit exponentially, with no kink, so the bend of a
+    // wave that reaches that way is as round as the other
+    const float edge = usual + (edgeThrow * swing(point.x, point.y));
+    if (edge >= knee) {
+        return edge;
     }
-    return std::max(edge / K_EDGE_DEPTH, MIN_DISTANCE);
+    const float range = knee - limit;
+    return range > 0.0F ? limit + (range * std::exp((edge - knee) / range)) : limit;
+}
+
+auto ShelterMap::Fade::at(float depth) const -> float
+{
+    if (depth <= 0.0F) {
+        return 1.0F;
+    }
+    // A smooth step down over the distance, bent to the material
+    const float t = distance > 0.0F ? std::clamp(depth / distance, 0.0F, 1.0F) : 1.0F;
+    return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), power);
 }
 
 auto ShelterMap::Field::topAt(int nodeX,
@@ -390,16 +409,17 @@ auto ShelterMap::Field::opennessAt(const RE::NiPoint3& point,
                                    const Slope& slope,
                                    const Fade& fade) const -> float
 {
-    // The fade as it is here, plus the spacing depthUnderCover's estimate gives up: a point deep
-    // under cover has to be able to reach 0, or nothing ever counts as covered
-    const float distance = fade.distanceAt(point);
-    const float depth = depthUnderCover(point, slope, distance + K_SPACING);
-    if (depth <= 0.0F) {
-        return 1.0F;
-    }
-    // A smooth step down over that distance, bent to the material (Fade)
-    const float t = distance > 0.0F ? std::clamp(depth / distance, 0.0F, 1.0F) : 1.0F;
-    return std::pow(1.0F - (t * t * (3.0F - (2.0F * t))), fade.power);
+    // The fade as it is here (swung), plus the spacing depthUnderCover's estimate gives up: a
+    // point deep under cover has to be able to reach 0, or nothing ever counts as covered
+    Fade here = fade;
+    here.distance = fade.distanceAt(point);
+    return here.at(depthUnderCover(point, slope, here.distance + K_SPACING));
+}
+
+auto ShelterMap::Field::heightAt(float x,
+                                 float y) const -> float
+{
+    return topAt(nearestNodeOf(x), nearestNodeOf(y));
 }
 
 auto ShelterMap::Field::anyCoverOver(float minX,

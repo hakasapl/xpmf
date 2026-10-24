@@ -146,10 +146,18 @@ public:
          * along the eave, and with it the depth the snow's edge lies at, which is K_EDGE_DEPTH of
          * it: by twice the throw, for the edge to move by the throw. Inwards that is all; outwards
          * the edge cannot pass the drip line (nothing in the open is touched), so a swing that
-         * takes it below half its usual depth eases it towards the drip line instead, and a
-         * large throw rounds the wave off short of it rather than running it flat along the eave.
+         * takes it shallower than three quarters of its usual depth eases it towards a quarter of
+         * it instead, and a large throw rounds the wave off short of the drip line rather than
+         * running it flat along the eave on the vertex fix's outermost row.
          */
         [[nodiscard]] auto distanceAt(const RE::NiPoint3& point) const -> float;
+
+        /**
+         * @brief Openness at a depth past where the fade begins: 1 at 0 and before it, 0 from the
+         * distance on, the bent falloff in between - what a point that far under cover gets, with
+         * the distance as it is (no swing)
+         */
+        [[nodiscard]] auto at(float depth) const -> float;
     };
 
     /**
@@ -163,6 +171,20 @@ public:
      */
     [[nodiscard]] static auto swing(float x,
                                     float y) -> float;
+
+    /**
+     * @brief Where an edge lies at a spot: its usual place swung by up to a throw by swing() there,
+     * and eased off rather than stopped on the side where it must not go - below the knee it
+     * closes on the limit exponentially, never reaching it, with no kink at the knee
+     *
+     * The roof shelter's snow edge (Fade::distanceAt) and the water's (WaterMask) both wave this
+     * way, each with its own usual place, throw, knee and limit.
+     */
+    [[nodiscard]] static auto swungEdge(const RE::NiPoint3& point,
+                                        float usual,
+                                        float edgeThrow,
+                                        float knee,
+                                        float limit) -> float;
 
     constexpr static float K_SWING_WAVELENGTH = 128.0F; /**< World units of the swing's main octave; 256 waved
                                                            too seldom in game */
@@ -285,6 +307,13 @@ public:
                                         float maxX,
                                         float maxY,
                                         float lowZ) const -> bool;
+
+        /**
+         * @brief The top surface height at the lattice node nearest to a world space point;
+         * K_NOTHING where no triangle covers it or the field has no map there
+         */
+        [[nodiscard]] auto heightAt(float x,
+                                    float y) const -> float;
 
     private:
         /**
