@@ -252,9 +252,11 @@ auto ProjectedGeometry::settingsOf(const Treatment& treatment,
         return kept != s_kept.end() && base != nullptr && (kept->second.*list).contains(base);
     };
     const bool shelter = profile.roofShelter && !named(&Kept::shelter);
-    return {.neutralizeColors = profile.neutralizeVertexColors && !named(&Kept::colors),
+    const bool neutralizeColors = profile.neutralizeVertexColors && !named(&Kept::colors);
+    return {.neutralizeColors = neutralizeColors,
             .neutralizeAlpha = profile.neutralizeVertexAlpha && !named(&Kept::alpha),
             .shelter = shelter,
+            .coverColors = neutralizeColors && !profile.roofShelter,
             .fixVertices = shelter && profile.roofShelterFixVertices,
             .specularMult = profile.specularMult};
 }
@@ -404,9 +406,10 @@ auto ProjectedGeometry::Clone3DHook::thunk(RE::TESBoundObject* base,
     }
     // Seasons of Skyrim's winter snow first: it goes over whatever the base form's own material
     // had the engine project
-    if (!dressWinterSnow(*root, stat)) {
+    const RE::NiMatrix3 placed = placedRotation(ref);
+    if (!dressWinterSnow(*root, stat, placed)) {
         if (const auto* const treatment = treatmentOf(stat->data.materialObj); treatment != nullptr) {
-            dressClone(*root, settingsOf(*treatment, stat));
+            dressClone(*root, settingsOf(*treatment, stat), placed);
         }
     }
 
@@ -434,20 +437,21 @@ auto ProjectedGeometry::WinterClone3DHook<N>::thunk(RE::TESBoundObject* base,
 {
     auto* const root = s_func(base, ref, arg3);
     if (root != nullptr && s_ready.load(std::memory_order_acquire)) {
-        dressWinterSnow(*root, ref != nullptr ? ref->GetBaseObject() : nullptr);
+        dressWinterSnow(*root, ref != nullptr ? ref->GetBaseObject() : nullptr, placedRotation(ref));
     }
     return root;
 }
 
 auto ProjectedGeometry::dressWinterSnow(RE::NiAVObject& root,
-                                        const RE::TESForm* base) -> bool
+                                        const RE::TESForm* base,
+                                        const RE::NiMatrix3& placed) -> bool
 {
     if (s_winterSnow == nullptr || !SeasonsOfSkyrim::hasWinterSnow(root)) {
         return false;
     }
     adoptWinterSnow(root, false); // a loader thread, and a fresh clone: none of it is on the list yet
     if (const auto* const treatment = withGeometry(s_winterSnow->second); treatment != nullptr) {
-        dressClone(root, settingsOf(*treatment, base));
+        dressClone(root, settingsOf(*treatment, base), placed);
     }
     return true;
 }
@@ -495,7 +499,8 @@ void ProjectedGeometry::adoptWinterSnow(RE::NiAVObject& root,
 }
 
 void ProjectedGeometry::dressClone(RE::NiAVObject& root,
-                                   const Settings& settings)
+                                   const Settings& settings,
+                                   const RE::NiMatrix3& placed)
 {
     forEachLeaf(root, K_MAX_NODES_PER_REF, false, [&](RE::NiAVObject& object) -> void {
         // Every lit shape the engine just put projected snow on gets the profile's specular...
@@ -514,12 +519,23 @@ void ProjectedGeometry::dressClone(RE::NiAVObject& root,
         if (!shape.has_value() || !shape->shader->flags.all(ShaderFlag::kProjectedUV, ShaderFlag::kVertexColors)) {
             return;
         }
+        // Which way is up for the shape where the reference will stand: the root takes the
+        // reference's rotation, what is below it keeps the model's own
+        RE::NiMatrix3 below;
+        if (&object != &root) {
+            below = object.local.rotate;
+            for (const RE::NiNode* node = object.parent; node != nullptr && node != &root; node = node->parent) {
+                below = node->local.rotate * below;
+            }
+        }
         const ProjectedVertexData::Shape description {.source = ProjectedVertexData::sourceOf(shape->data),
                                                       .vertexCount = shape->vertexCount,
                                                       .triangleCount = shape->triangleCount,
                                                       .colorsEnabled = true,
                                                       .keepAlpha = shape->keepAlpha,
                                                       .neutralize = settings.neutralizeColors,
+                                                      .up = upIn(placed * below),
+                                                      .snowFrom = thresholdOf(*shape->shader) + K_BLEND_FLOOR,
                                                       .shelter = settings.shelter,
                                                       .neutralizeAlpha = settings.neutralizeAlpha,
                                                       .fixVertices = settings.fixVertices && shape->refinable};
@@ -527,6 +543,34 @@ void ProjectedGeometry::dressClone(RE::NiAVObject& root,
             ProjectedVertexData::install(*shape->shape, variant);
         }
     });
+}
+
+auto ProjectedGeometry::placedRotation(const RE::TESObjectREFR* ref) -> RE::NiMatrix3
+{
+    RE::NiMatrix3 rotation;
+    if (ref != nullptr) {
+        const RE::NiPoint3 angle = ref->GetAngle();
+        rotation.SetEulerAnglesXYZ(angle.x, angle.y, angle.z);
+    }
+    return rotation;
+}
+
+auto ProjectedGeometry::upIn(const RE::NiMatrix3& rotation) -> RE::NiPoint3
+{
+    // World up is (0, 0, 1); in the shape's frame that is the transpose's last column
+    return {rotation.entry[2][0], rotation.entry[2][1], rotation.entry[2][2]};
+}
+
+auto ProjectedGeometry::thresholdOf(const RE::BSLightingShaderProperty& shader) -> float
+{
+    const auto& projection = shader.projectedUVParams;
+    const float cosAngle = projection.alpha;
+    return ((1.0F - cosAngle) * projection.green) + cosAngle;
+}
+
+auto ProjectedGeometry::holdsSnowFrom(float threshold) -> float
+{
+    return std::max(threshold + K_BLEND_FLOOR, K_MIN_UP);
 }
 
 void ProjectedGeometry::scaleSpecular(RE::BSLightingShaderProperty& shader,
@@ -1291,10 +1335,11 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
         return;
     }
 
-    // Anything of those kinds may be a roof as long as one profile asks for shelter. A receiver is
-    // what stands under a material of a profile - which for the engine is a static's own, and for
-    // Seasons of Skyrim's winter snow whatever 3D carries its tag, over anything the base form says
-    const bool shelter = mayShelter && ConfigLoader::isAnyRoofSheltered();
+    // Anything of those kinds may be a roof as long as one profile measures cover, for its shelter
+    // or for its colors. A receiver is what stands under a material of a profile - which for the
+    // engine is a static's own, and for Seasons of Skyrim's winter snow whatever 3D carries its
+    // tag, over anything the base form says
+    const bool shelter = mayShelter && ConfigLoader::isAnyCoverMeasured();
     const auto* const stat = base->As<RE::TESObjectSTAT>();
     const bool winterSnow = s_winterSnow != nullptr && SeasonsOfSkyrim::hasWinterSnow(*root);
     if (winterSnow) {
@@ -1357,14 +1402,11 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
             return;
         }
 
-        // What the shader will compare dot(normal, up) * alpha against on this shape, from the
-        // values it was given to project with - (falloff scale, falloff bias, 1 / noise UV scale,
-        // cos(max angle)), which is what Clone3D copies from the static and its material and what
-        // Seasons of Skyrim writes itself - exactly as SetupGeometry derives it
-        const auto& projection = shape->shader->projectedUVParams;
-        const float cosAngle = projection.alpha;
-        const float threshold = ((1.0F - cosAngle) * projection.green) + cosAngle;
-        const float noiseAmplitude = (1.0F - cosAngle) * projection.red;
+        // What the shader will compare dot(normal, up) * alpha against on this shape, and how far
+        // the noise can raise that
+        const float threshold = thresholdOf(*shape->shader);
+        const float cosAngle = shape->shader->projectedUVParams.alpha;
+        const float noiseAmplitude = (1.0F - cosAngle) * shape->shader->projectedUVParams.red;
         ProjectedVertexData::addRef(source);
         gather.receivers.push_back(
             {.keepAlive = RE::NiPointer<RE::BSTriShape> {shape->shape},
@@ -1374,6 +1416,8 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
                        .colorsEnabled = colorsEnabled,
                        .keepAlpha = shape->keepAlpha,
                        .neutralize = settings.neutralizeColors,
+                       .up = upIn(shape->shape->world.rotate),
+                       .snowFrom = threshold + K_BLEND_FLOOR,
                        .shelter = settings.shelter,
                        .neutralizeAlpha = settings.neutralizeAlpha,
                        .fixVertices = settings.fixVertices && shape->refinable},
@@ -1392,6 +1436,7 @@ void ProjectedGeometry::collectReference(RE::TESObjectREFR& ref)
              .currentAlphaThreshold = shape->alphaTest != nullptr ? shape->alphaTest->alphaThreshold : std::uint8_t {0},
              .reference = ref.GetFormID(),
              .decal = shape->shader->flags.any(ShaderFlag::kDecal, ShaderFlag::kDynamicDecal),
+             .coverColors = settings.coverColors,
              .plainTriShape = shape->refinable});
     });
 }
@@ -1444,7 +1489,7 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     }
     cell.receiversSince = now;
 
-    if (!ConfigLoader::isAnyRoofSheltered()) {
+    if (!ConfigLoader::isAnyCoverMeasured()) {
         return; // nothing was gathered to rasterize
     }
     cell.rasterInFlight = true;
@@ -1801,7 +1846,6 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
                               Lead* leading) -> Judgement
 {
     constexpr float FULL = VertexLayout::COLOR_MAX; /**< As a float, for the alpha arithmetic */
-    constexpr float MIN_UP = 0.05F; /**< Below this a surface carries no snow, and dividing by it is unwise */
     using Colors = ProjectedVertexData::Colors;
 
     Judgement judgement;
@@ -1828,6 +1872,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     auto& measured = scratch.measured;
     auto& facing = scratch.facing;
     auto& values = scratch.values;
+    auto& cover = scratch.cover;
 
     // World space normals: the rotation alone, a NiTransform scaling uniformly. Their z is how
     // far up a vertex faces; their tilt is what the shelter map reads its own surface by
@@ -1849,7 +1894,7 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     // (0.4), instead of the walkway going bare at the first hint of cover.
     const auto goneAlpha = [&](float facingValue) -> float {
         return std::clamp(
-            K_NORMAL_MAP_SAFETY * (receiver.threshold + K_BLEND_FLOOR) / std::max(facingValue, MIN_UP), 0.0F, 1.0F);
+            K_NORMAL_MAP_SAFETY * (receiver.threshold + K_BLEND_FLOOR) / std::max(facingValue, K_MIN_UP), 0.0F, 1.0F);
     };
     // ...and where on that scale snow visibly ends on a flat surface (projection weight 0 at
     // average noise), which is what the edge localization aims for
@@ -1864,9 +1909,16 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     // ...and what the fade under cover is bent to pass at a fixed share of its distance, so
     // that one shelterFade ends the snow as far in on this material as on any other
     const ShelterMap::Fade fade = ShelterMap::Fade::of(receiver.fade, edgeOpenness);
+    // How far a vertex's color is whitened for its snow, as far as the cover goes: fully where
+    // the snow is visibly there, at the edge openness and above, and less as the cover takes it,
+    // down to the mesh's own color where it is gone
+    const auto coverOf = [&](float vertexOpenness) -> std::uint8_t {
+        const float open = std::clamp(vertexOpenness / edgeOpenness, 0.0F, 1.0F);
+        return static_cast<std::uint8_t>((open * open * (3.0F - (2.0F * open)) * FULL) + 0.5F);
+    };
 
     // A vertex holds snow if it could show any with nothing overhead
-    const float holdsSnowFrom = std::max(receiver.threshold + K_BLEND_FLOOR, MIN_UP);
+    const float holdsSnowFrom = ProjectedGeometry::holdsSnowFrom(receiver.threshold);
 
     // A shape without a CPU index list still gets per vertex values, just no edge placement
     // and no refinement
@@ -1879,12 +1931,17 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
     auto verdict = ShelterMap::Verdict::OPEN;
     std::optional<ShelterRefinement::Result> refinement;
     bool carried = false; // the topology is a refined twin's, to be shared whatever the verdict
-    if (shelter) {
+    // Cover is measured for the roof shelter, and for the colors alone where the profile
+    // neutralizes them and shelters nothing: what stands under cover keeps the mesh's colors,
+    // the projection there staying as it is
+    const bool colorsOnly = !shelter && receiver.coverColors && receiver.shape.colorsEnabled;
+    bool colorCover = false; // colorsOnly, and something stands over the shape
+    if (shelter || colorsOnly) {
         worldPositions(receiver, *layout, positions);
         bool anyCover = field.initialOpenness(positions, normals, fade, openness);
         measured.clear();
 
-        if (lead != nullptr) {
+        if (shelter && lead != nullptr) {
             // A twin of a refined shape is cut the way that was, whatever its own cover says
             // (ShelterTwins): copies of one surface only agree on depth while they are
             // triangulated alike
@@ -1937,7 +1994,8 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
                         = anyCover || std::ranges::any_of(openness, [](float value) -> bool { return value < 1.0F; });
                 }
             }
-        } else if (mayRefine && receiver.shape.fixVertices && !receiver.shape.keepAlpha && !indices.empty()) {
+        } else if (shelter && mayRefine && receiver.shape.fixVertices && !receiver.shape.keepAlpha
+                   && !indices.empty()) {
             // The vertex fix, where the profile wants it and the shape can take it: with a vertex
             // under cover there is a fade to follow; without one there may still be a roof edge
             // crossing the middle of a triangle, which is worth a look only if any column over
@@ -1990,8 +2048,12 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
             for (std::size_t index = 0; index < positions.size(); ++index) {
                 facing[index] = layout->hasNormals ? normals[index].z : 1.0F;
             }
-            verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
-                                        !receiver.shape.keepAlpha);
+            if (shelter) {
+                verdict = ShelterMap::judge(ShelterMap::tally(openness, facing, holdsSnowFrom, edgeOpenness),
+                                            !receiver.shape.keepAlpha);
+            } else {
+                colorCover = true;
+            }
         }
     }
 
@@ -2006,15 +2068,40 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
         return receiver.projected == projectedWanted && fingerprint == receiver.currentFingerprint
             && threshold == receiver.currentAlphaThreshold;
     };
-    if (verdict == ShelterMap::Verdict::OPEN) {
+    // Covered without a roof shelter, the colors are the mesh's as far as the cover reaches - which
+    // changes nothing on a vertex the shared variant leaves the mesh's colors already, facing
+    // away from the snow
+    bool coverChanges = false;
+    if (colorCover) {
+        cover.resize(vertexCount);
+        for (std::uint32_t index = 0; index < vertexCount; ++index) {
+            cover[index] = coverOf(openness[index]);
+            coverChanges = coverChanges
+                || (cover[index] < VertexLayout::COLOR_MAX
+                    && ProjectedVertexData::whitenWeight(facing[index], receiver.shape.snowFrom) > 0.0F);
+        }
+    }
+    if (coverChanges) {
+        // The alpha as the shared variant has it: values of 1 leave it
+        values.assign(vertexCount, VertexLayout::COLOR_MAX);
+        if (keepsCurrent(ProjectedVertexData::fingerprint(values, cover), true, alphaThreshold)) {
+            judgement.keep = true;
+            return judgement;
+        }
+        wanted = ProjectedVertexData::custom(receiver.shape, values, cover);
+        if (wanted == nullptr) {
+            wanted = ProjectedVertexData::shared(receiver.shape); // over budget
+            judgement.unmet = true;
+        }
+    } else if (verdict == ShelterMap::Verdict::OPEN) {
         if (carried) {
-            if (keepsCurrent(ProjectedVertexData::fingerprintRefined({}, *refinement, Colors::kProjected),
+            if (keepsCurrent(ProjectedVertexData::fingerprintRefined({}, {}, *refinement, Colors::kProjected),
                              true,
                              alphaThreshold)) {
                 judgement.keep = true;
                 return judgement;
             }
-            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, Colors::kProjected);
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, {}, Colors::kProjected);
             if (wanted == nullptr) {
                 judgement.twinFailed = true;
                 return judgement;
@@ -2029,12 +2116,13 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
         // the twin of a refined one
         projected = false;
         if (carried) {
-            if (keepsCurrent(
-                    ProjectedVertexData::fingerprintRefined({}, *refinement, Colors::kModel), false, alphaThreshold)) {
+            if (keepsCurrent(ProjectedVertexData::fingerprintRefined({}, {}, *refinement, Colors::kModel),
+                             false,
+                             alphaThreshold)) {
                 judgement.keep = true;
                 return judgement;
             }
-            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, Colors::kModel);
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, {}, {}, Colors::kModel);
             if (wanted == nullptr) {
                 judgement.twinFailed = true;
                 return judgement;
@@ -2045,25 +2133,28 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
             wanted = receiver.shape.source;
         }
     } else {
-        // One value per vertex of the shape as it will be drawn: the model's, then the added
+        // One value per vertex of the shape as it will be drawn: the model's, then the added. The
+        // alpha, and how far the vertex's color is whitened for the snow the cover leaves it
         const std::size_t total = openness.size();
         values.resize(total);
+        cover.resize(total);
         for (std::size_t index = 0; index < total; ++index) {
             const float gone = goneAlpha(facing[index]);
             values[index] = static_cast<std::uint8_t>(((gone + ((1.0F - gone) * openness[index])) * FULL) + 0.5F);
+            cover[index] = coverOf(openness[index]);
         }
         if (receiver.alphaTest) {
             // Such a shape paints no alpha (all 1), so the lowest value is the lowest alpha it gets
             alphaThreshold = scaledAlphaThreshold(receiver.alphaThreshold, *std::ranges::min_element(values));
         }
         const std::uint64_t fingerprint = refinement.has_value()
-            ? ProjectedVertexData::fingerprintRefined(values, *refinement)
-            : ProjectedVertexData::fingerprint(values);
+            ? ProjectedVertexData::fingerprintRefined(values, cover, *refinement)
+            : ProjectedVertexData::fingerprint(values, cover);
         if (keepsCurrent(fingerprint, true, alphaThreshold)) {
             judgement.keep = true;
             drawsRefined = refinement.has_value(); // what it already has
         } else if (refinement.has_value()) {
-            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values);
+            wanted = ProjectedVertexData::customRefined(receiver.shape, *refinement, values, cover);
             if (wanted != nullptr) {
                 drawsRefined = true;
                 s_refinedBuilds.fetch_add(1, std::memory_order_relaxed);
@@ -2079,11 +2170,12 @@ auto ProjectedGeometry::judge(const ShelterMap::Field& field,
             } else {
                 // The refined buffer could not be had (the budget, or a failed creation): the
                 // mask on the model's own vertices is still the better part of the fix
-                wanted = ProjectedVertexData::custom(receiver.shape, std::span {values}.first(vertexCount));
+                wanted = ProjectedVertexData::custom(
+                    receiver.shape, std::span {values}.first(vertexCount), std::span {cover}.first(vertexCount));
                 judgement.unmet = true;
             }
         } else {
-            wanted = ProjectedVertexData::custom(receiver.shape, values);
+            wanted = ProjectedVertexData::custom(receiver.shape, values, cover);
         }
         if (!judgement.keep && wanted == nullptr) {
             if (carried) {

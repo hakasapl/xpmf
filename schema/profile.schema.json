@@ -90,7 +90,7 @@
         "neutralizeVertexColors": {
             "type": "boolean",
             "default": true,
-            "description": "Whether shapes that carry the projection get white vertex colors, so that the colors a mesh's author painted (usually baked shadow) do not darken the snow."
+            "description": "Whether shapes that carry the projection get white vertex colors where snow can land, so that the colors a mesh's author painted (usually baked shadow) do not darken the snow. Vertices the snow cannot reach (facing sideways or down where the object stands, or under cover) keep the mesh's colors: baked shading on cliff faces, the fade to black down a cave or mine entrance. Measures cover even with roofShelter off."
         },
         "neutralizeVertexColorsSkip": {
             "$ref": "#/definitions/patternListOrNull",

@@ -135,8 +135,8 @@ void MaterialMatcher::onDataLoaded()
     }
 
     // The game's own coverage noise is what every material without a noise of its own is drawn with.
-    // Only roof shelter cares what it averages
-    const bool shelter = ConfigLoader::isAnyRoofSheltered();
+    // Only what measures cover cares what it averages: where snow visibly ends under a roof
+    const bool shelter = ConfigLoader::isAnyCoverMeasured();
     const float gameNoise = shelter ? meanNoise({}) : VANILLA_MEAN_NOISE;
 
     ProjectedGeometry::Materials materials;
@@ -188,8 +188,9 @@ void MaterialMatcher::onDataLoaded()
             }
         }
         // Where a snow line lies under a roof depends on the average of the noise its draws sample
+        const bool measuresCover = profile.roofShelter || profile.neutralizeVertexColors;
         const float noiseAverage
-            = profile.roofShelter && match.has_value() && match->ownNoise ? meanNoise(profile.noiseTexture) : gameNoise;
+            = measuresCover && match.has_value() && match->ownNoise ? meanNoise(profile.noiseTexture) : gameNoise;
 
         std::size_t statics = 0;
         for (const auto* const candidate : ours) {

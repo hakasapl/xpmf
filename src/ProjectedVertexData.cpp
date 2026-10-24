@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -228,7 +229,23 @@ auto ProjectedVertexData::shared(const Shape& shape) -> Data*
         return shape.source;
     }
 
-    const SharedKey key {.source = shape.source, .whiten = shape.neutralize, .resetAlpha = resetAlpha};
+    // Whitened, the colors depend on which way is up for the shape, and on the material: rounded,
+    // so that the clone and the cell pass, which come to them from two roundings of one rotation,
+    // name the same variant, and the variant is built from the rounded values its key says
+    SharedKey key {.source = shape.source, .whiten = shape.neutralize, .resetAlpha = resetAlpha};
+    Shape rounded = shape;
+    if (shape.neutralize) {
+        const auto step = [](float value) -> std::int16_t {
+            constexpr float LIMIT = 16.0F; /**< Well past any up component or threshold, well inside an int16 */
+            return static_cast<std::int16_t>(std::lround(std::clamp(value, -LIMIT, LIMIT) * K_ORIENTATION_STEPS));
+        };
+        key.up = {step(shape.up.x), step(shape.up.y), step(shape.up.z)};
+        key.snowFrom = step(shape.snowFrom);
+        rounded.up
+            = RE::NiPoint3 {static_cast<float>(key.up[0]), static_cast<float>(key.up[1]), static_cast<float>(key.up[2])}
+            * (1.0F / K_ORIENTATION_STEPS);
+        rounded.snowFrom = static_cast<float>(key.snowFrom) / K_ORIENTATION_STEPS;
+    }
     const std::scoped_lock lock(s_lock);
     if (const auto found = s_shared.find(key); found != s_shared.end()) {
         addRef(found->second);
@@ -241,7 +258,7 @@ auto ProjectedVertexData::shared(const Shape& shape) -> Data*
     recipe.whiten = shape.neutralize;
     recipe.resetAlpha = resetAlpha;
 
-    Data* const variant = build(shape, recipe);
+    Data* const variant = build(rounded, recipe);
     if (variant == nullptr) {
         return nullptr;
     }
@@ -259,9 +276,11 @@ auto ProjectedVertexData::shared(const Shape& shape) -> Data*
 }
 
 auto ProjectedVertexData::custom(const Shape& shape,
-                                 std::span<const std::uint8_t> values) -> Data*
+                                 std::span<const std::uint8_t> values,
+                                 std::span<const std::uint8_t> cover) -> Data*
 {
-    if (shape.source == nullptr || values.size() != shape.vertexCount) {
+    if (shape.source == nullptr || values.size() != shape.vertexCount
+        || (!cover.empty() && cover.size() != shape.vertexCount)) {
         return nullptr;
     }
     {
@@ -271,11 +290,13 @@ auto ProjectedVertexData::custom(const Shape& shape,
         }
     }
 
-    // Only a shape whose alpha is free to be written gets this far (see ShelterMap::judge), so
-    // it starts from the mesh's own unless the profile neutralizes it or the shader never showed it
+    // The alpha starts from the mesh's own unless the profile neutralizes it or the shader never
+    // showed it. A shape that keeps its alpha only gets here for its colors, with values of 1
+    // (ShelterMap::judge masks it all or nothing)
     Recipe recipe;
     recipe.whiten = !shape.colorsEnabled || shape.neutralize;
-    recipe.resetAlpha = !shape.colorsEnabled || shape.neutralizeAlpha;
+    recipe.cover = cover;
+    recipe.resetAlpha = !shape.colorsEnabled || (shape.neutralizeAlpha && !shape.keepAlpha);
     recipe.values = values;
     Data* const variant = build(shape, recipe);
     if (variant == nullptr) {
@@ -294,7 +315,7 @@ auto ProjectedVertexData::custom(const Shape& shape,
     s_variants.emplace(variant,
                        Entry {.source = shape.source,
                               .bytes = bytes,
-                              .fingerprint = fingerprint(values),
+                              .fingerprint = fingerprint(values, cover),
                               .colorless = !shape.colorsEnabled});
     s_privateBytes += bytes;
     return variant;
@@ -303,13 +324,14 @@ auto ProjectedVertexData::custom(const Shape& shape,
 auto ProjectedVertexData::customRefined(const Shape& shape,
                                         const ShelterRefinement::Result& refinement,
                                         std::span<const std::uint8_t> values,
+                                        std::span<const std::uint8_t> cover,
                                         Colors colors) -> Data*
 {
     // The rest - the vertex count, the triangle list, what the added vertices blend - build() checks
     const std::size_t vertices = static_cast<std::size_t>(shape.vertexCount) + refinement.added.size();
     const std::size_t triangles = refinement.indices.size() / 3;
     if (shape.source == nullptr || refinement.added.empty() || (!values.empty() && values.size() != vertices)
-        || triangles > K_MAX_COUNT) {
+        || (!cover.empty() && cover.size() != vertices) || triangles > K_MAX_COUNT) {
         return nullptr;
     }
     {
@@ -327,6 +349,7 @@ auto ProjectedVertexData::customRefined(const Shape& shape,
         recipe.resetAlpha = !shape.colorsEnabled;
     } else {
         recipe.whiten = !shape.colorsEnabled || shape.neutralize;
+        recipe.cover = cover;
         recipe.resetAlpha = !shape.colorsEnabled || (shape.neutralizeAlpha && !shape.keepAlpha);
         recipe.values = values;
     }
@@ -345,7 +368,7 @@ auto ProjectedVertexData::customRefined(const Shape& shape,
     s_variants.emplace(variant,
                        Entry {.source = shape.source,
                               .bytes = bytes,
-                              .fingerprint = fingerprintRefined(values, refinement, colors),
+                              .fingerprint = fingerprintRefined(values, cover, refinement, colors),
                               .colorless = !shape.colorsEnabled,
                               .refined = true,
                               .counts = {.vertices = static_cast<std::uint16_t>(vertices),
@@ -397,14 +420,18 @@ auto ProjectedVertexData::fingerprintOf(const Data* data) -> std::uint64_t
     return found != s_variants.end() ? found->second.fingerprint : 0;
 }
 
-auto ProjectedVertexData::fingerprint(std::span<const std::uint8_t> values) -> std::uint64_t
+auto ProjectedVertexData::fingerprint(std::span<const std::uint8_t> values,
+                                      std::span<const std::uint8_t> cover) -> std::uint64_t
 {
     constexpr std::uint64_t OFFSET_BASIS = 0xCBF29CE484222325ULL;
-    const std::uint64_t hash = hashBytes(values, OFFSET_BASIS);
+    constexpr std::uint64_t COVER_SALT = 0xC0E5ULL; /**< So that values with a cover and without never agree */
+    std::uint64_t hash = hashBytes(values, OFFSET_BASIS);
+    hash = hashBytes(cover, hash ^ (cover.empty() ? 0 : COVER_SALT));
     return hash != 0 ? hash : 1; // 0 means "not a private variant"
 }
 
 auto ProjectedVertexData::fingerprintRefined(std::span<const std::uint8_t> values,
+                                             std::span<const std::uint8_t> cover,
                                              const ShelterRefinement::Result& refinement,
                                              Colors colors) -> std::uint64_t
 {
@@ -412,7 +439,9 @@ auto ProjectedVertexData::fingerprintRefined(std::span<const std::uint8_t> value
     constexpr std::uint64_t REFINED_SALT = 0x51F15ED0000ULL; /**< So that values on the model's topology and the
                                                                 same values on a refined one never agree */
     constexpr std::uint64_t MODEL_SALT = 0x0DE1C0105ULL; /**< ...nor the model's colors with the projection's */
+    constexpr std::uint64_t COVER_SALT = 0xC0E5ULL;
     std::uint64_t hash = hashBytes(values, OFFSET_BASIS ^ REFINED_SALT ^ (colors == Colors::kModel ? MODEL_SALT : 0));
+    hash = hashBytes(cover, hash ^ (cover.empty() ? 0 : COVER_SALT));
     const std::span<const std::uint8_t> indexBytes {
         reinterpret_cast<const std::uint8_t*>(refinement.indices.data()), // NOLINT: bytes of a trivial array
         refinement.indices.size() * sizeof(std::uint16_t)};
@@ -524,7 +553,16 @@ auto ProjectedVertexData::SharedKeyHash::operator()(const SharedKey& key) const 
 {
     constexpr std::size_t WHITEN_SALT = 0x9E3779B97F4A7C15ULL; /**< So the keys of one source never collide */
     constexpr std::size_t RESET_SALT = 0x517CC1B727220A95ULL;
-    return std::hash<const Data*> {}(key.source) ^ (key.whiten ? WHITEN_SALT : 0) ^ (key.resetAlpha ? RESET_SALT : 0);
+    const std::size_t hash
+        = std::hash<const Data*> {}(key.source) ^ (key.whiten ? WHITEN_SALT : 0) ^ (key.resetAlpha ? RESET_SALT : 0);
+    return static_cast<std::size_t>(hashValue(key.snowFrom, hashValue(key.up, hash)));
+}
+
+auto ProjectedVertexData::whitenWeight(float facing,
+                                       float snowFrom) -> float
+{
+    const float t = std::clamp((facing - (snowFrom - K_WHITEN_REACH)) / K_WHITEN_REACH, 0.0F, 1.0F);
+    return t * t * (3.0F - (2.0F * t));
 }
 
 auto ProjectedVertexData::build(const Shape& shape,
@@ -577,7 +615,20 @@ auto ProjectedVertexData::build(const Shape& shape,
         const std::array<std::uint8_t, VertexLayout::COLOR_SIZE> before {color[0], color[1], color[2], color[3]};
 
         if (recipe.whiten) {
-            std::ranges::fill(color.first(K_RGB), VertexLayout::COLOR_MAX);
+            // As white as snow can land there: by how far up the vertex faces where the instance
+            // stands, and how far in the open it is. Colors the shader never showed may hold
+            // anything, and a mesh without normals gives no facing: white throughout
+            float weight = 1.0F;
+            if (shape.colorsEnabled && sourceLayout->hasNormals) {
+                weight = whitenWeight(layout->normal(to).Dot(shape.up), shape.snowFrom);
+            }
+            if (shape.colorsEnabled && !recipe.cover.empty()) {
+                weight *= static_cast<float>(recipe.cover[index]) / VertexLayout::COLOR_MAX;
+            }
+            for (auto& channel : color.first(K_RGB)) {
+                const float value = static_cast<float>(channel);
+                channel = static_cast<std::uint8_t>(value + (weight * (VertexLayout::COLOR_MAX - value)) + 0.5F);
+            }
         }
         if (recipe.resetAlpha) {
             color[K_RGB] = VertexLayout::COLOR_MAX;

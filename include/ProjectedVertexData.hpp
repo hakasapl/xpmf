@@ -4,6 +4,7 @@
 
 #include "PCH.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -30,8 +31,9 @@ namespace XPMF {
  * so they are ordinary renderer data to everything else - the decal builder included, which
  * is why each gets a copy of the source's CPU index list as well.
  *
- * Most shapes with a projection on them share one variant per model and profile setting: white
- * colors (a profile's neutralizeVertexColors), and the alpha either as the mesh has it - a mask
+ * Most shapes with a projection on them share one variant per model, profile setting and
+ * orientation: colors white where snow can land (a profile's neutralizeVertexColors, see below),
+ * and the alpha either as the mesh has it - a mask
  * its author painted stays a mask - or reset to 1 (neutralizeVertexAlpha), the projection then
  * covering the whole shape; each setting except on the statics its skip list names (see
  * ProjectedGeometry). Only a shape partly under cover gets a private variant, because only
@@ -49,9 +51,15 @@ namespace XPMF {
  * BSTriShape draws by its own vertex and triangle counts, which install() therefore sets to a
  * refined variant's and puts back to the model's when anything else goes in.
  *
- * Whitening is all or nothing per shape. Which vertices end up under snow depends on the
- * instance's orientation, the static's angle, the material and the noise, and guessing at that
- * per vertex buys little: a shape with a projection on it has white colors, everywhere.
+ * Whitening goes vertex by vertex, as far as snow can land there: a vertex facing up enough for
+ * the material to put snow on it turns white, one facing sideways or down keeps the mesh's
+ * colors, with a soft step between (whitenWeight), and in a private variant a vertex under cover
+ * keeps them as well, as deep as the snow has gone from it. Colors only tint what is drawn, and
+ * where no snow is drawn the mesh's are what its author wanted shown: the baked shade on a cliff
+ * face, the fade to black down a cave or mine entrance, a dark doorway. How far up a vertex faces
+ * is a matter of where the instance stands (half the snowed rocks in the game lean by more than
+ * 15 degrees), so the shared variant is per orientation as well: upright instances, turned about
+ * the vertical alone, share one; a leaning one has its own unless another leans the same way.
  *
  * The registry keeps one reference on every variant and one on its source. The second pins
  * the source's address, which is the cache key; the first means a variant whose count is back
@@ -84,7 +92,14 @@ public:
                               nothing through */
         // The profile's geometry settings, each for a static its skip list does not name
         // (ProjectedGeometry::settingsOf)
-        bool neutralize {}; /**< neutralizeVertexColors: colors the shader shows become white */
+        bool neutralize {}; /**< neutralizeVertexColors: colors the shader shows become white where snow can land */
+        RE::NiPoint3 up {0.0F, 0.0F, 1.0F}; /**< World up in the shape's own frame: a vertex faces up by
+                                                dot(normal, up) where the instance stands. Its rotation's
+                                                last row */
+        float snowFrom {}; /**< How far up a vertex has to face for the material to put any snow on it: the
+                              shader's threshold plus ProjectedGeometry::K_BLEND_FLOOR, below 0 on a material
+                              that snows past the vertical; with neutralize, colors are white from there up and
+                              the mesh's below it (whitenWeight) */
         bool shelter {}; /**< roofShelter: whether cover is measured for the shape at all */
         bool neutralizeAlpha {}; /**< neutralizeVertexAlpha: the alpha starts from 1 rather than from the mesh's
                                     own - on a shape that shows its colors and whose alpha is not transparency
@@ -117,21 +132,27 @@ public:
     [[nodiscard]] static auto shared(const Shape& shape) -> Data*;
 
     /**
-     * @brief Builds a private variant with the shelter in its alpha (colors as for the shared one)
+     * @brief Builds a private variant with the shelter in its alpha (colors as for the shared one,
+     * less where the cover keeps the snow off)
      *
      * @param values Per vertex, 0..255 for 0..1: what the alpha the shape starts from (the mesh's
      *        own, or 1 with neutralizeAlpha) is multiplied by
+     * @param cover Per vertex, 0..255 for 0..1: how far in the open the vertex is as far as its
+     *        color goes, which its whitening is multiplied by - 1 where its snow is all there, 0
+     *        where the cover has taken it all; empty for in the open throughout
      * @return Data* As for shared(); also nullptr once K_BUDGET is spent
      */
     [[nodiscard]] static auto custom(const Shape& shape,
-                                     std::span<const std::uint8_t> values) -> Data*;
+                                     std::span<const std::uint8_t> values,
+                                     std::span<const std::uint8_t> cover) -> Data*;
 
     /**
      * @brief What a refined variant's colors are made of
      */
     enum class Colors {
-        kProjected, /**< As for the shape's projection: white where the profile neutralizes colors, the alpha reset
-                       where it neutralizes alpha (and the shape does not keep its own), then scaled by the values */
+        kProjected, /**< As for the shape's projection: white where the profile neutralizes colors and snow can land
+                       (and is not kept off by the cover), the alpha reset where it neutralizes alpha (and the shape
+                       does not keep its own), then scaled by the values */
         kModel /**< The model's own colors and alpha, for a twin whose projection is switched off: it draws the
                   refined triangles with the shading the mesh was given */
     };
@@ -145,13 +166,30 @@ public:
      * @param values As for custom(), one per vertex of the refined shape: the model's first, the
      *        added ones after them; empty leaves the alpha as the colors start it (a twin that
      *        only has to share the topology)
+     * @param cover As for custom(), one per vertex of the refined shape, or empty
      * @return Data* New data carrying one reference for the caller, never the source; nullptr as
      *         for custom(), or when the refined shape would exceed what a BSTriShape counts
      */
     [[nodiscard]] static auto customRefined(const Shape& shape,
                                             const ShelterRefinement::Result& refinement,
                                             std::span<const std::uint8_t> values,
+                                            std::span<const std::uint8_t> cover,
                                             Colors colors = Colors::kProjected) -> Data*;
+
+    /**
+     * @brief How white a vertex's color is made, 0 (the mesh's) .. 1 (white), by how far up it faces
+     *
+     * White from snowFrom up, where the material can put snow on the vertex; the mesh's from
+     * K_WHITEN_REACH below that, where nothing can; smoothly between. The step sits below the
+     * threshold rather than across it because colors are interpolated over each triangle: a
+     * vertex just short of holding snow is the corner of triangles that do, and the snow on them
+     * takes its tint partly from it.
+     *
+     * @param facing dot(normal, up): how far up the vertex faces where its instance stands
+     * @param snowFrom Shape::snowFrom
+     */
+    [[nodiscard]] static auto whitenWeight(float facing,
+                                           float snowFrom) -> float;
 
     /**
      * @brief Resolves renderer data to the model's original: itself, unless it is a variant
@@ -183,14 +221,17 @@ public:
     [[nodiscard]] static auto fingerprintOf(const Data* data) -> std::uint64_t;
 
     /**
-     * @brief Fingerprint custom() would store for these values
+     * @brief Fingerprint custom() would store for these values and this cover
      */
-    [[nodiscard]] static auto fingerprint(std::span<const std::uint8_t> values) -> std::uint64_t;
+    [[nodiscard]] static auto fingerprint(std::span<const std::uint8_t> values,
+                                          std::span<const std::uint8_t> cover) -> std::uint64_t;
 
     /**
-     * @brief Fingerprint customRefined() would store for these values on this refinement, made of these colors
+     * @brief Fingerprint customRefined() would store for these values and this cover on this
+     * refinement, made of these colors
      */
     [[nodiscard]] static auto fingerprintRefined(std::span<const std::uint8_t> values,
+                                                 std::span<const std::uint8_t> cover,
                                                  const ShelterRefinement::Result& refinement,
                                                  Colors colors = Colors::kProjected) -> std::uint64_t;
 
@@ -226,12 +267,21 @@ private:
                                                                                 and index data (held twice: once
                                                                                 by the GPU, once as the engine's
                                                                                 CPU copy) before custom() declines */
+    constexpr static float K_WHITEN_REACH = 0.3F; /**< How far below Shape::snowFrom, in facing, a vertex's color
+                                                     starts to whiten (whitenWeight) */
+    constexpr static float K_ORIENTATION_STEPS = 1024.0F; /**< Steps per unit that a shared variant's up and
+                                                             snowFrom are rounded to: the clone and the cell pass
+                                                             work them out from two roundings of one rotation,
+                                                             and have to name the same variant */
 
     /**
      * @brief How a variant's colors are derived from the source's
      */
     struct Recipe {
-        bool whiten {}; /**< rgb = white; otherwise the mesh's */
+        bool whiten {}; /**< rgb towards white as far as snow can land (whitenWeight, times the cover), all white
+                           where the shader never showed the colors; otherwise the mesh's */
+        std::span<const std::uint8_t> cover; /**< One per vertex, 0..255 for 0..1, what the whitening is multiplied
+                                                by; empty for 1 throughout */
         bool resetAlpha {}; /**< alpha = 1 to begin with: the mesh's was never shown (Vertex_Colors off) and may
                                hold anything, or the profile neutralizes it; otherwise the mesh's own... */
         std::span<const std::uint8_t> values; /**< ...multiplied by these, one per vertex, 0..255 for 0..1; empty
@@ -255,6 +305,8 @@ private:
         const Data* source {};
         bool whiten {}; /**< One model can stand under the materials of two profiles, one of each setting... */
         bool resetAlpha {}; /**< ...and under two statics of one profile, one of which its skip list names */
+        std::array<std::int16_t, 3> up {}; /**< With whiten: Shape::up in K_ORIENTATION_STEPS; zero otherwise */
+        std::int16_t snowFrom {}; /**< With whiten: Shape::snowFrom in K_ORIENTATION_STEPS; zero otherwise */
         auto operator==(const SharedKey&) const -> bool = default;
     };
 

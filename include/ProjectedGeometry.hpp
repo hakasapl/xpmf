@@ -49,9 +49,12 @@ namespace XPMF {
  * The first pass happens inside TESBoundObject::Clone3D, hooked through TESObjectSTAT's vtable
  * (slot 0x40; statics are the only forms the engine applies a material object to). The engine
  * has just set Projected_UV on the clone's shader properties, nothing else can see the clone
- * yet, and it gets the shared (white) variant there and then - so snow has the right color from the
- * first frame, on large references too. What cannot be known at that point is where the
- * clone will end up, which way will be up for it, and what will stand above it.
+ * yet, and it gets the shared variant there and then - so snow has the right color from the
+ * first frame, on large references too. Which way will be up for it is known already: the
+ * reference's angles, which the engine turns into the root's rotation right after
+ * (placedRotation), and the shared variant's colors are white as far as snow can land on it
+ * standing that way. What cannot be known at that point is what will stand above it - and with
+ * it, which of its colors the cover keeps the snow off, roof shelter or not.
  *
  * That is the cell pass, laid out like SmoothTerrain's mesh contact detection because it has
  * the same constraints:
@@ -86,7 +89,13 @@ namespace XPMF {
  *    projected onto. That switch is also all that can be done for a shape whose vertex
  *    alpha is already spoken for - a blended overlay, an alpha tested cutout - where lowering
  *    alpha would make the shape itself fade or vanish: such a shape loses its snow as a whole
- *    once half of what could hold snow on it is under cover.
+ *    once half of what could hold snow on it is under cover. Wherever cover takes snow away, the
+ *    vertex colors go back to the mesh's with it. A shape whose profile neutralizes its colors
+ *    and shelters nothing is judged for the colors alone: its projection and alpha stay as they
+ *    are, and if anything stands over it, it gets a private variant whose colors are the mesh's
+ *    under cover - the floor of a cave mouth under its own rock stays the black it fades to, its
+ *    snow tinted as the game has it. So cover is measured, and occluders gathered, whenever a
+ *    profile does either.
  *  - Results are applied, and every pinned pointer let go, back on the main thread in batches.
  *
  * Exterior cells only: indoors everything is under a roof, and the snow that is there was put
@@ -170,6 +179,8 @@ private:
     constexpr static float K_NORMAL_MAP_SAFETY = 0.85F; /**< Per pixel normals lean further up than the vertex
                                                            normal; "just gone" alpha is lowered by this much
                                                            so bumps under cover stay bare */
+    constexpr static float K_MIN_UP = 0.05F; /**< Below this a surface carries no snow, and dividing by it is
+                                                unwise */
 
     /**
      * @brief Vtable hook on TESObjectSTAT's TESBoundObject::Clone3D slot
@@ -247,6 +258,7 @@ private:
         RE::FormID reference {}; /**< The reference the shape belongs to: the shapes of one reference that draw the
                                     same triangles are cut alike (ShelterTwins) */
         bool decal {}; /**< Decal or Dynamic_Decal shader flag: drawn with a depth bias, so a twin of nothing */
+        bool coverColors {}; /**< Settings::coverColors: judged for its colors alone, its projection left as it is */
         bool plainTriShape {}; /**< ShapeView::refinable: a triangle list that may be traded for another */
 
         /**
@@ -384,9 +396,12 @@ private:
      * @brief What a profile's geometry settings come to for one static
      */
     struct Settings {
-        bool neutralizeColors {}; /**< Its shapes get white vertex colors */
+        bool neutralizeColors {}; /**< Its shapes get white vertex colors where snow can land */
         bool neutralizeAlpha {}; /**< Its shapes start from a vertex alpha of 1 */
         bool shelter {}; /**< Its shapes lose the projection under cover */
+        bool coverColors {}; /**< Its shapes keep the mesh's colors under cover all the same: the profile
+                                neutralizes colors and shelters nothing (a static its roofShelterSkip names is
+                                to stay snowed under its roof, white colors and all) */
         bool fixVertices {}; /**< Its shapes partly under cover get vertices where the cover changes
                                 (ShelterRefinement); only ever with shelter */
         std::optional<float> specularMult; /**< What its shapes' specular strength is multiplied by; std::nullopt
@@ -420,9 +435,38 @@ private:
      * @brief Gives the shapes of a fresh clone the shared variant of its settings
      *
      * @param settings settingsOf the clone's base form
+     * @param placed The rotation the engine will give the clone's root where the reference stands
+     *        (placedRotation): the clone still carries the model's, and whitened colors go by which
+     *        way is up for each shape
      */
     static void dressClone(RE::NiAVObject& root,
-                           const Settings& settings);
+                           const Settings& settings,
+                           const RE::NiMatrix3& placed);
+
+    /**
+     * @brief The rotation TESObjectREFR::Update3DPosition gives a reference's root: its angles as
+     * rotations about x, then y, then z (1.7.99 0x1402DFD50 builds it at 0x140EDE020, the matrix
+     * NiMatrix3::SetEulerAnglesXYZ makes); identity for no reference
+     */
+    [[nodiscard]] static auto placedRotation(const RE::TESObjectREFR* ref) -> RE::NiMatrix3;
+
+    /**
+     * @brief World up in the frame of a shape whose world rotation is this: the matrix's last row
+     */
+    [[nodiscard]] static auto upIn(const RE::NiMatrix3& rotation) -> RE::NiPoint3;
+
+    /**
+     * @brief What dot(normal, up) * alpha has to exceed for the shader to put snow on a pixel, from
+     * the values a shape was given to project with - (falloff scale, falloff bias, 1 / noise UV
+     * scale, cos(max angle)), which is what Clone3D copies from the static and its material and what
+     * Seasons of Skyrim writes itself - exactly as SetupGeometry derives it
+     */
+    [[nodiscard]] static auto thresholdOf(const RE::BSLightingShaderProperty& shader) -> float;
+
+    /**
+     * @brief How far up a vertex has to face to show any snow with nothing overhead, for a threshold
+     */
+    [[nodiscard]] static auto holdsSnowFrom(float threshold) -> float;
 
     /**
      * @brief Scales the specular strength of a shape's material, on a copy of the material
@@ -449,10 +493,12 @@ private:
      * engine projected a profile's material onto
      *
      * @param base The clone's base form, for settingsOf; nullptr when not known
+     * @param placed As for dressClone
      * @return bool Whether the clone carries that snow; false leaves it to its base form's material
      */
     static auto dressWinterSnow(RE::NiAVObject& root,
-                                const RE::TESForm* base) -> bool;
+                                const RE::TESForm* base,
+                                const RE::NiMatrix3& placed) -> bool;
 
     /**
      * @brief Gives the shapes under a root Seasons of Skyrim snowed on the projection color its
@@ -613,6 +659,8 @@ private:
         std::vector<bool> measured; /**< Per vertex, whether the vertex fix has its openness in hand */
         std::vector<float> facing;
         std::vector<std::uint8_t> values; /**< Per vertex, what the mesh's alpha is scaled by, or becomes */
+        std::vector<std::uint8_t> cover; /**< Per vertex, how far in the open it is for its color
+                                            (ProjectedVertexData::custom) */
     };
 
     /**

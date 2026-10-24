@@ -103,7 +103,9 @@ public:
         std::string lodMaterialHD; /**< Same for the HD shapes (full textures, the nearest level); empty = the
                                       plain one */
 
-        bool neutralizeVertexColors {}; /**< Whether shapes that carry the projection get white vertex colors */
+        bool neutralizeVertexColors {}; /**< Whether shapes that carry the projection get white vertex colors where
+                                           snow can land (facing up enough for the material, not under cover);
+                                           elsewhere they keep the mesh's */
         std::vector<std::string> neutralizeVertexColorsSkip; /**< Lower case wildcard patterns (* and ?) over the
                                                                 EditorIDs of the statics whose shapes keep the
                                                                 mesh's colors all the same; none by default */
@@ -198,9 +200,16 @@ public:
     [[nodiscard]] static auto isAnySpecularChanged() -> bool;
 
     /**
-     * @brief Whether any profile keeps its projection out from under roofs, i.e. whether height maps are needed
+     * @brief Whether any profile keeps its projection out from under roofs
      */
     [[nodiscard]] static auto isAnyRoofSheltered() -> bool;
+
+    /**
+     * @brief Whether any profile needs to know what stands over its shapes, i.e. whether height maps
+     * are needed: for its roof shelter, or for its neutralized vertex colors, which stay the mesh's
+     * where the snow cannot reach
+     */
+    [[nodiscard]] static auto isAnyCoverMeasured() -> bool;
 
     /**
      * @brief Whether any profile names a LOD material, i.e. whether the object LOD hook is needed

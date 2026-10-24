@@ -570,6 +570,13 @@ auto ConfigLoader::isAnySpecularChanged() -> bool
 
 auto ConfigLoader::isAnyRoofSheltered() -> bool { return std::ranges::any_of(s_profiles, &Profile::roofShelter); }
 
+auto ConfigLoader::isAnyCoverMeasured() -> bool
+{
+    return std::ranges::any_of(s_profiles, [](const Profile& profile) -> bool {
+        return profile.roofShelter || profile.neutralizeVertexColors;
+    });
+}
+
 auto ConfigLoader::isAnyLodMaterialNamed() -> bool
 {
     return std::ranges::any_of(s_profiles, [](const Profile& profile) -> bool { return !profile.lodMaterial.empty(); });
