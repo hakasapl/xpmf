@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 using namespace XPMF;
@@ -268,7 +269,7 @@ auto ProjectedVertexData::shared(const Shape& shape) -> Data*
         addRef(shape.source);
         s_variants.emplace(variant, Entry {.source = shape.source, .isShared = true});
     } else {
-        addRef(shape.source); // "nothing to change" is remembered too; this pin is the shared map's
+        addRef(shape.source); // "nothing to change" is remembered too; this pin is the entry's (collectGarbage)
     }
     s_shared.emplace(key, variant);
     addRef(variant); // the caller's
@@ -531,12 +532,22 @@ void ProjectedVertexData::collectGarbage()
             dead.push_back(item.second.source);
             return true;
         });
+        // An identical-to-source entry pins its source once per key, and one model is asked for
+        // under many (an orientation each, a setting each): the source is unused once its count
+        // is down to those pins, which then go all at once. Waiting for a count of 1 kept every
+        // model with two such entries, and its buffers, for good
+        std::unordered_map<const Data*, std::uint32_t> pins;
+        for (const auto& [key, data] : s_shared) {
+            if (data == key.source) {
+                ++pins[data];
+            }
+        }
         std::erase_if(s_shared, [&](const auto& item) -> bool {
             Data* const data = item.second;
             if (std::ranges::find(deadVariants, data) != deadVariants.end()) {
                 return true; // a variant that just went; the registry's reference was its only one
             }
-            if (data != item.first.source || data->refCount > 1) {
+            if (data != item.first.source || data->refCount > pins.at(data)) {
                 return false;
             }
             dead.push_back(data); // an identical-to-source entry whose model has been unloaded

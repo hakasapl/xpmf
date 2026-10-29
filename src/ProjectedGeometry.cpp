@@ -1172,6 +1172,7 @@ void ProjectedGeometry::dropCell(CellKey key)
     }
     if (s_gather.has_value() && s_gather->key == key) {
         retire(s_gather->occluders);
+        retire(s_gather->waters);
         retire(s_gather->receivers);
         s_gather.reset();
     }
@@ -1534,6 +1535,7 @@ void ProjectedGeometry::finishGather(Clock::time_point now)
     const auto found = s_cells.find(gather.key);
     if (found == s_cells.end()) {
         retire(gather.occluders);
+        retire(gather.waters);
         retire(gather.receivers);
         return;
     }

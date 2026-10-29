@@ -63,7 +63,9 @@ namespace XPMF {
  *
  * The registry keeps one reference on every variant and one on its source. The second pins
  * the source's address, which is the cache key; the first means a variant whose count is back
- * to 1 has no users left, which is how collectGarbage finds what to free.
+ * to 1 has no users left, which is how collectGarbage finds what to free. A shared entry that
+ * found nothing to change holds the source itself, with a reference per entry: such a source
+ * has no users left once its count is down to its entries.
  */
 class ProjectedVertexData {
 public:
