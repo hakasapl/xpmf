@@ -153,8 +153,8 @@ void MaterialMatcher::onDataLoaded()
         // and the projected textures like vanilla's does), as does every one of a profile that
         // patches nothing - but the shapes under either still carry a projection, which is what
         // the vertex color and roof shelter parts work on.
-        // Whether the profile has anything for the records at all: a texture, a falloff value or
-        // a max angle
+        // Whether the profile has anything for the records at all: a texture, a falloff value, a
+        // tiling or a max angle
         const bool patches = profile.patchesMaterial();
         std::vector<const Candidate*> ours;
         std::vector<const Candidate*> untouched;
@@ -215,7 +215,8 @@ void MaterialMatcher::onDataLoaded()
 
             // Scale, bias and noise scale: the profile's where it gives one, the material's own
             // where not - which keeps its coverage what it was. The noise scale takes the
-            // projected textures' tiling with it (see the class)
+            // projected textures' tiling with it unless the profile tiles them its own way (see
+            // the class)
             if (profile.overridesFalloff()) {
                 const auto take = [](float& field, const std::optional<float>& given) -> std::string {
                     const float before = field;
@@ -359,14 +360,16 @@ auto MaterialMatcher::matchTextures(const ConfigLoader::Profile& profile) -> std
         }
     };
 
-    // The textures themselves, through a color that says whose draw it is: white where the
-    // profile's diffuse supplies the look (its average, where the shader is set to sample none),
-    // the record's own where the game's diffuse stays
+    // The textures themselves (and their tiling), through a color that says whose draw it is:
+    // white where the profile's diffuse supplies the look (its average, where the shader is set to
+    // sample none), the record's own where the game's diffuse stays
+    const ProjectedTextures::Tiling tiling {.material = profile.materialUVScale, .detail = profile.detailUVScale};
     if (const auto added = ProjectedTextures::add({.diffuse = profile.diffuseTexture,
                                                    .normal = profile.normalTexture,
                                                    .noise = profile.noiseTexture,
                                                    .detailNormal = profile.detailNormalTexture,
-                                                   .pbr = profile.pbr});
+                                                   .pbr = profile.pbr},
+                                                  tiling);
         added.has_value()) {
         Match match {.set = added->set, .ownNoise = added->ownNoise};
         if (replacesDiffuse && sampled) {
@@ -394,14 +397,20 @@ auto MaterialMatcher::matchTextures(const ConfigLoader::Profile& profile) -> std
     }
 
     // The diffuse did not load as a renderer texture (or no set could be added for it). From here
-    // on the color has to carry it, which leaves nothing to tag: the profile's draws cannot be
-    // told apart, and its other textures stay the game's
+    // on the color has to carry it, and its other textures stay the game's; only a tiling of the
+    // profile's own still gets a set of its own, with no textures in it, for its draws to be told
+    // apart by
     const auto mean = TextureColor::meanColor(profile.diffuseTexture);
     if (!mean.has_value()) {
         spdlog::error("Profile '{}': without {} there is nothing to match", profile.label(), profile.diffuseTexture);
         return std::nullopt;
     }
     Match match {.color = *mean};
+    if (!tiling.namesNothing()) {
+        if (const auto added = ProjectedTextures::add({}, tiling); added.has_value()) {
+            match.set = added->set;
+        }
+    }
     if (sampled) {
         // The shader multiplies the color with the game's diffuse, so that one's average has to
         // come out again: per channel ratio of the two averages, a channel the divisor has next

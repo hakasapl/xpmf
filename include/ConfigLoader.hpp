@@ -49,7 +49,8 @@ public:
      * @brief One profile: which material objects, and what is done for them
      *
      * The settings fall into the plugin's three independent parts - patching the material (the
-     * four textures, the three falloff values, maxAngle and the LOD materials, each applied when given),
+     * four textures, the three falloff values, the two tilings, maxAngle and the LOD materials,
+     * each applied when given),
      * neutralizeVertexColors, and the vertex alpha (neutralizeVertexAlpha, roofShelter with
      * shelterFade, shelterRandomness and roofShelterFixVertices, waterFade) - and any combination
      * of them works. Each of the three geometry settings comes with a skip list: wildcard patterns
@@ -85,8 +86,19 @@ public:
                                              "Light" ones that are a dusting */
         std::optional<float> noiseUVScale; /**< World units per tile of the coverage noise - and, the shader tiling
                                               the projected textures at a fixed ratio to it, of the profile's
-                                              textures. 20 to 1500 on the vanilla materials; above 0, the engine
-                                              divides by it */
+                                              textures unless the two below say otherwise. 20 to 1500 on the
+                                              vanilla materials; above 0, the engine divides by it */
+
+        // The projected textures' tiling, which is no value of the record: the shader tiles the
+        // diffuse and normal map at fProjectedUVDiffuseNormalTilingScale times the noise's
+        // frequency and the detail normal at fProjectedUVNormalDetailTilingScale times it, two
+        // Prefs settings the engine hands it draw by draw - and the draw hook hands it others for
+        // the profile's draws instead (ProjectedTextures). Above 0, in noiseUVScale's units;
+        // std::nullopt = the settings' ratio to the noise, as the game has it
+        std::optional<float> materialUVScale; /**< World units per tile of the projected diffuse and normal map,
+                                                 whatever the noise's scale */
+        std::optional<float> detailUVScale; /**< World units per tile of the projected detail normal, whatever the
+                                               noise's scale */
         std::optional<float> maxAngle; /**< The one value the path reads that is the static's rather than the
                                           material's: the DNAM max angle, in degrees, of every static carrying one
                                           of the profile's patched material objects; the projection needs
@@ -159,13 +171,21 @@ public:
         }
 
         /**
+         * @brief Whether the profile tiles any projected texture its own way
+         */
+        [[nodiscard]] auto overridesTiling() const -> bool
+        {
+            return materialUVScale.has_value() || detailUVScale.has_value();
+        }
+
+        /**
          * @brief Whether the profile has anything for its material objects (or their statics) at
-         * all: a texture named, or any of the material values given
+         * all: a texture named, or any of the material values or tilings given
          */
         [[nodiscard]] auto patchesMaterial() const -> bool
         {
             return !diffuseTexture.empty() || !normalTexture.empty() || !noiseTexture.empty()
-                || !detailNormalTexture.empty() || overridesFalloff() || maxAngle.has_value();
+                || !detailNormalTexture.empty() || overridesFalloff() || overridesTiling() || maxAngle.has_value();
         }
     };
 

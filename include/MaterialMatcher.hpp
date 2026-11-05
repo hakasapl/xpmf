@@ -73,7 +73,9 @@ namespace XPMF {
  * Tiling goes with the coverage: the shader derives the projected diffuse's coordinates from the
  * coverage noise's, scaled by fProjectedUVDiffuseNormalTilingScale, and the noise's scale is the
  * material's own noiseUVScale (vanilla ones run from 20 to 1500) - so a texture at another scale
- * takes another noise scale, which a profile can give its materials (noiseUVScale, below).
+ * takes another noise scale, which a profile can give its materials (noiseUVScale, below). Or the
+ * profile tiles its textures apart from the noise (materialUVScale, detailUVScale): no value of
+ * the record, but of the two settings, which ProjectedTextures replaces for the profile's draws.
  *
  * The values are written into the existing materials rather than into new forms that statics get
  * pointed at. Rendering cannot tell the difference - Clone3D reads the same values off whichever
@@ -83,7 +85,8 @@ namespace XPMF {
  * one ran still matches, and the LOD materials above are covered by the same loop. Each material
  * also keeps its own scale, bias and noise scale unless the profile gives one (falloffScale,
  * falloffBias, noiseUVScale: the three of the record's values the single pass path reads, so the
- * only three there is anything to override), so nothing gains or loses cover that the profile did
+ * only three there is anything to override; the record's materialUVScale is the multipass
+ * path's), so nothing gains or loses cover that the profile did
  * not ask for; only the color changes (the snow flag stays as the record has it). The fourth
  * value the path reads, the max angle, is the static's rather than the material's (its DNAM), so
  * a profile's maxAngle is written into the statics that carry its patched materials instead.

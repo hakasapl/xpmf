@@ -407,6 +407,10 @@ void ConfigLoader::loadConfig()
             profile.falloffScale = fields.optionalNumber("falloffScale");
             profile.falloffBias = fields.optionalNumber("falloffBias");
             profile.noiseUVScale = fields.optionalNumber("noiseUVScale", 0.0);
+            // The projected textures' tiling apart from the noise's, handed to the shader draw by
+            // draw (ProjectedTextures), which divides by them as well
+            profile.materialUVScale = fields.optionalNumber("materialUVScale", 0.0);
+            profile.detailUVScale = fields.optionalNumber("detailUVScale", 0.0);
             // The static's angle, the fourth value the single pass path reads: written into the
             // statics themselves (MaterialMatcher)
             profile.maxAngle = fields.optionalNumberBetween("maxAngle", 0.0, MAX_ANGLE_LIMIT);
@@ -523,6 +527,14 @@ void ConfigLoader::loadConfig()
         spdlog::info("Config Loaded: [{}] Falloff Scale: {}", profile.name, orRecord(profile.falloffScale));
         spdlog::info("Config Loaded: [{}] Falloff Bias: {}", profile.name, orRecord(profile.falloffBias));
         spdlog::info("Config Loaded: [{}] Noise UV Scale: {}", profile.name, orRecord(profile.noiseUVScale));
+        spdlog::info("Config Loaded: [{}] Material UV Scale: {}",
+                     profile.name,
+                     profile.materialUVScale.has_value() ? std::format("{}", *profile.materialUVScale)
+                                                         : "(the game's ratio to the noise)");
+        spdlog::info("Config Loaded: [{}] Detail UV Scale: {}",
+                     profile.name,
+                     profile.detailUVScale.has_value() ? std::format("{}", *profile.detailUVScale)
+                                                       : "(the game's ratio to the noise)");
         spdlog::info("Config Loaded: [{}] Max Angle: {}", profile.name, orRecord(profile.maxAngle));
         spdlog::info("Config Loaded: [{}] LOD Identifier: {} (HD shapes {}HD)",
                      profile.name,
