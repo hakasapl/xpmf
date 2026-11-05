@@ -9,13 +9,17 @@
 #include <DirectXTex.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -29,33 +33,39 @@ void ProjectedTextures::install()
     spdlog::info("Lighting shader SetupGeometry hook installed");
 }
 
-auto ProjectedTextures::add(const Paths& paths) -> std::optional<Added>
+auto ProjectedTextures::add(const Paths& paths,
+                            const Tiling& tiling) -> std::optional<Added>
 {
     if (s_active.load(std::memory_order_acquire)) {
         spdlog::error("Projected textures were asked for after the draw hook went live; nothing was loaded");
         return std::nullopt; // the sets must not change under a running hook
     }
-    if (paths.namesNothing()) {
+    if (paths.namesNothing() && tiling.namesNothing()) {
         return Added {}; // the game's textures throughout: nothing to tell draws apart for
     }
     for (std::size_t set = 0; set < s_count; ++set) {
-        if (s_sets.at(set).paths == paths) {
+        if (s_sets.at(set).paths == paths && s_sets.at(set).tiling == tiling) {
             return Added {.set = set, .ownNoise = s_sets.at(set).noise != nullptr};
         }
     }
     const auto orNone = [](const std::string& path) -> const char* { return path.empty() ? "(none)" : path.c_str(); };
+    const auto orGameRatio = [](const std::optional<float>& worldUnits) -> std::string {
+        return worldUnits.has_value() ? std::format("{:g}", *worldUnits) : "(the game's ratio to the noise)";
+    };
     if (s_count >= MAX_SETS) {
         spdlog::error("More than {} different sets of projected textures; the set of diffuse {}, normal {}, noise {}, "
-                      "detail normal {} gets none",
+                      "detail normal {}, material UV scale {}, detail UV scale {} gets none",
                       MAX_SETS,
                       orNone(paths.diffuse),
                       orNone(paths.normal),
                       orNone(paths.noise),
-                      orNone(paths.detailNormal));
+                      orNone(paths.detailNormal),
+                      orGameRatio(tiling.material),
+                      orGameRatio(tiling.detail));
         return std::nullopt;
     }
 
-    Set fresh {.paths = paths};
+    Set fresh {.paths = paths, .tiling = tiling};
     if (!paths.diffuse.empty()) {
         fresh.diffuse = paths.pbr ? holdForPbr(paths.diffuse) : hold(paths.diffuse);
         if (fresh.diffuse == nullptr) {
@@ -75,9 +85,9 @@ auto ProjectedTextures::add(const Paths& paths) -> std::optional<Added>
     fresh.normal = holdOrKeep(paths.normal, "normal");
     fresh.noise = holdOrKeep(paths.noise, "noise");
     fresh.detailNormal = holdOrKeep(paths.detailNormal, "detail normal");
-    if (fresh.diffuse == nullptr && fresh.normal == nullptr && fresh.noise == nullptr
-        && fresh.detailNormal == nullptr) {
-        return Added {}; // nothing loaded that would be swapped in
+    if (fresh.diffuse == nullptr && fresh.normal == nullptr && fresh.noise == nullptr && fresh.detailNormal == nullptr
+        && tiling.namesNothing()) {
+        return Added {}; // nothing loaded that would be swapped in, and nothing to tile
     }
 
     const std::size_t set = s_count;
@@ -87,13 +97,16 @@ auto ProjectedTextures::add(const Paths& paths) -> std::optional<Added>
         return holder != nullptr ? path.c_str() : "(the game's)";
     };
     const Set& added = s_sets.at(set);
-    spdlog::info("Projected texture set {}: diffuse {}{}, normal {}, noise {}, detail normal {}",
+    spdlog::info("Projected texture set {}: diffuse {}{}, normal {}, noise {}, detail normal {}; material UV scale {}, "
+                 "detail UV scale {}",
                  set + 1,
                  orGame(paths.diffuse, added.diffuse),
                  paths.pbr ? " (for PBR)" : "",
                  orGame(paths.normal, added.normal),
                  orGame(paths.noise, added.noise),
-                 orGame(paths.detailNormal, added.detailNormal));
+                 orGame(paths.detailNormal, added.detailNormal),
+                 orGameRatio(tiling.material),
+                 orGameRatio(tiling.detail));
     return Added {.set = set, .ownNoise = added.noise != nullptr};
 }
 
@@ -114,6 +127,14 @@ void ProjectedTextures::activate()
 {
     if (s_count == 0 || s_active.load(std::memory_order_acquire)) {
         return;
+    }
+    // The settings the shader's tiling comes from, where a set has a tiling of its own to put there
+    const auto sets = std::span(s_sets).first(s_count);
+    if (std::ranges::any_of(sets, [](const Set& set) -> bool { return set.tiling.material.has_value(); })) {
+        s_diffuseTiling = floatSetting(DIFFUSE_TILING_SETTING);
+    }
+    if (std::ranges::any_of(sets, [](const Set& set) -> bool { return set.tiling.detail.has_value(); })) {
+        s_detailTiling = floatSetting(DETAIL_TILING_SETTING);
     }
     s_active.store(true, std::memory_order_release);
     spdlog::info("{} projected texture sets are live; every material without one keeps the game's textures", s_count);
@@ -217,6 +238,33 @@ auto ProjectedTextures::holdForPbr(const std::string& dataPath) -> TexturePointe
     return new TexturePointer {clone}; // NOLINT(cppcoreguidelines-owning-memory): never freed on purpose
 }
 
+auto ProjectedTextures::floatSetting(const char* name) -> RE::Setting*
+{
+    auto* const setting = RE::GetINISetting(name);
+    if (setting == nullptr || setting->GetType() != RE::Setting::Type::kFloat) {
+        spdlog::warn("{} is not a float setting of the game's, so the profiles' tiling that goes there cannot apply; "
+                     "their textures keep the game's ratio to the noise",
+                     name);
+        return nullptr;
+    }
+    spdlog::info(
+        "{} is {:g}; the profiles that give their own tiling replace it draw by draw", name, setting->GetFloat());
+    return setting;
+}
+
+auto ProjectedTextures::tilesPerNoiseTile(const std::optional<float>& worldUnits,
+                                          float noiseFrequency) -> std::optional<float>
+{
+    if (!worldUnits.has_value()) {
+        return std::nullopt;
+    }
+    // The shader samples the texture at the noise's coordinates times the setting, and those are
+    // the projection's world units times the noise's frequency: one tile of the texture every
+    // worldUnits of them is 1 / (worldUnits * frequency) texture tiles per noise tile
+    const float tiles = 1.0F / (*worldUnits * noiseFrequency);
+    return std::isfinite(tiles) && tiles > 0.0F ? std::optional<float> {tiles} : std::nullopt;
+}
+
 auto ProjectedTextures::setOf(const RE::NiColorA& color) -> std::size_t
 {
     // The signature first: two twelve bit patterns no arithmetic lands on. Then the set, whose
@@ -270,7 +318,25 @@ void ProjectedTextures::SetupGeometryHook::thunk(RE::BSLightingShader* shader,
     const Set& set = s_sets.at(tagged);
     const bool surface = samplesProjectedTextures(((pass->passEnum - LIGHTING_TECHNIQUE_START) >> LIGHTING_TYPE_SHIFT)
                                                   & LIGHTING_TYPE_MASK);
+    // The tiling the same way: what the settings the engine copies into ProjectedUVParams3 have to
+    // say for the set's world units per tile on this draw's noise scale - the property's, which
+    // the engine passes on as ProjectedUVParams.z - swapped in and out like the textures. Only
+    // where the shader samples a diffuse, normal and detail normal at all
+    const float noiseFrequency = property->projectedUVParams.blue;
+    std::optional<float> diffuseTiling
+        = surface && s_diffuseTiling != nullptr ? tilesPerNoiseTile(set.tiling.material, noiseFrequency) : std::nullopt;
+    std::optional<float> detailTiling
+        = surface && s_detailTiling != nullptr ? tilesPerNoiseTile(set.tiling.detail, noiseFrequency) : std::nullopt;
+    const auto swapTiling = [](RE::Setting* setting, std::optional<float>& value) -> void {
+        if (value.has_value()) {
+            const float held = setting->GetFloat();
+            setting->SetFloat(*value);
+            value = held;
+        }
+    };
     const auto swapAll = [&]() -> void {
+        swapTiling(s_diffuseTiling, diffuseTiling);
+        swapTiling(s_detailTiling, detailTiling);
         if (set.noise != nullptr) {
             std::swap(state->defaultTextureProjNoiseMap, *set.noise);
         }

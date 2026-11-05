@@ -63,7 +63,19 @@
             "type": ["number", "null"],
             "exclusiveMinimum": 0,
             "default": null,
-            "description": "The material objects' noise UV scale: world units per tile of the coverage noise, and, the shader tiling the projected textures at a fixed ratio to it, of the profile's textures. 20 to 1500 on the vanilla materials. null or absent = as each record has it."
+            "description": "The material objects' noise UV scale: world units per tile of the coverage noise, and, the shader tiling the projected textures at a fixed ratio to it, of the profile's textures unless materialUVScale and detailUVScale say otherwise. 20 to 1500 on the vanilla materials. null or absent = as each record has it."
+        },
+        "materialUVScale": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": null,
+            "description": "World units per tile of the projected diffuse and normal map, whatever the noise UV scale: the size of the profile's texture on its materials, apart from the size of the coverage pattern. Not a value of the record: the game tiles both maps at fProjectedUVDiffuseNormalTilingScale (SkyrimPrefs.ini, 0.5 by default) times the noise's frequency, which the plugin replaces draw by draw for the profile's draws, object LOD included. Twice the noise UV scale gives what the default setting does. The multipass material UV scale of a record is measured differently and is not this. null or absent = the game's ratio to the noise."
+        },
+        "detailUVScale": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "default": null,
+            "description": "World units per tile of the projected detail normal, whatever the noise UV scale. The game tiles it at fProjectedUVNormalDetailTilingScale (SkyrimPrefs.ini, 1.2 by default) times the noise's frequency, which the plugin replaces draw by draw for the profile's draws, object LOD included. The noise UV scale divided by 1.2 gives what the default setting does. null or absent = the game's ratio to the noise."
         },
         "maxAngle": {
             "type": ["number", "null"],

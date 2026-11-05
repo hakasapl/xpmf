@@ -59,6 +59,19 @@ namespace XPMF {
  * With linear lighting off the same holds: the projected block then decodes nothing, and the PBR
  * base color is put back into sRGB space by Diffuse(). Nothing about the file changes.
  *
+ * The same call decides how the textures are tiled. For every projected draw SetupGeometry copies
+ * two Prefs settings into ProjectedUVParams3, as they are: fProjectedUVDiffuseNormalTilingScale,
+ * diffuse and normal map tiles per tile of the coverage noise, and fProjectedUVNormalDetailTilingScale,
+ * the detail normal's. Every single pass projected pixel shader there is - the 804 variants in the
+ * game's shader package and Community Shaders' alike - samples the noise at its coordinates times
+ * ProjectedUVParams.z (1 / the material's noise UV scale), the diffuse and normal map at those
+ * times the first setting and the detail normal at those times the second; the multipass ones
+ * read neither setting. So a set that tiles a texture its own way (materialUVScale,
+ * detailUVScale) has the setting say, for the length of the call, whatever puts the texture at
+ * the set's world units per tile on this draw's noise scale - and the noise keeps its own. The
+ * engine reads the values in that one place only, and they are the game's again before the call
+ * returns, like the textures.
+ *
  * Community Shaders hooks the same virtual (vtable write, chained). This hook is installed at
  * plugin load, theirs at kPostPostLoad, so theirs wraps this one; neither writes what the other
  * reads. ENB sees ordinary D3D calls coming out of the engine's own state flush.
@@ -88,11 +101,26 @@ public:
     };
 
     /**
+     * @brief How one profile tiles the projected textures, in world units per tile; std::nullopt
+     * leaves the game's ratio to the noise
+     */
+    struct Tiling {
+        std::optional<float> material; /**< The diffuse and normal map (materialUVScale) */
+        std::optional<float> detail; /**< The detail normal (detailUVScale) */
+        auto operator==(const Tiling&) const -> bool = default;
+
+        /**
+         * @brief Whether no tiling is given at all
+         */
+        [[nodiscard]] auto namesNothing() const -> bool { return !material.has_value() && !detail.has_value(); }
+    };
+
+    /**
      * @brief What add() made of a set of paths
      */
     struct Added {
         std::optional<std::size_t> set; /**< The set the paths became, for tag(); std::nullopt when nothing at all
-                                           is substituted (no path named, or none of them loaded) */
+                                           is substituted (no path named or none of them loaded, and no tiling) */
         bool ownNoise {}; /**< Whether draws of the set sample a coverage noise other than the game's */
     };
 
@@ -109,10 +137,12 @@ public:
      *
      * @param paths What to project. A diffuse that fails to load fails the set; any of the other
      *        three that does is logged and left to the game's texture
+     * @param tiling How to tile it: a set of its own even where no texture is named
      * @return std::optional<Added> std::nullopt when the diffuse did not load as a renderer texture
      *         or there is no room for another set
      */
-    [[nodiscard]] static auto add(const Paths& paths) -> std::optional<Added>;
+    [[nodiscard]] static auto add(const Paths& paths,
+                                  const Tiling& tiling) -> std::optional<Added>;
 
     /**
      * @brief A color marked as belonging to a set: what a material of the set's profile is given
@@ -154,12 +184,19 @@ private:
      * static's destructor would release a texture at exit, when the renderer may already be gone.
      */
     struct Set {
-        Paths paths; /**< What it was loaded from: two profiles with the same textures share a set */
+        Paths paths; /**< What it was loaded from: two profiles with the same textures and tiling share a set */
+        Tiling tiling;
         TexturePointer* diffuse {};
         TexturePointer* normal {};
         TexturePointer* noise {};
         TexturePointer* detailNormal {};
     };
+
+    constexpr static const char* DIFFUSE_TILING_SETTING
+        = "fProjectedUVDiffuseNormalTilingScale:Display"; /**< ProjectedUVParams3.x: diffuse and normal map tiles per
+                                                             noise tile (0.5 by default) */
+    constexpr static const char* DETAIL_TILING_SETTING
+        = "fProjectedUVNormalDetailTilingScale:Display"; /**< ProjectedUVParams3.y: the detail normal's (1.2) */
 
     constexpr static std::uint32_t MARK_MASK = 0xFFFU; /**< The twelve lowest mantissa bits of red and green hold
                                                           the signature... */
@@ -207,8 +244,26 @@ private:
      */
     [[nodiscard]] static auto holdForPbr(const std::string& dataPath) -> TexturePointer*;
 
+    /**
+     * @brief The Prefs setting under a name, if it is there and holds a float; logged when not
+     */
+    [[nodiscard]] static auto floatSetting(const char* name) -> RE::Setting*;
+
+    /**
+     * @brief What a tiling setting has to say for a draw: texture tiles per tile of the noise
+     *
+     * @param worldUnits World units per tile of the texture, if the set gives any
+     * @param noiseFrequency The draw's ProjectedUVParams.z: noise tiles per world unit
+     * @return std::optional<float> std::nullopt where the game's setting stays: no tiling given, or
+     *         no finite value above 0 to be had
+     */
+    [[nodiscard]] static auto tilesPerNoiseTile(const std::optional<float>& worldUnits,
+                                                float noiseFrequency) -> std::optional<float>;
+
     static inline std::array<Set, MAX_SETS> s_sets; /**< Written before s_active, read only after */
     static inline std::size_t s_count = 0; /**< Ditto */
+    static inline RE::Setting* s_diffuseTiling {}; /**< Ditto; nullptr unless a set tiles the diffuse its own way */
+    static inline RE::Setting* s_detailTiling {}; /**< Ditto, for the detail normal */
     static inline std::atomic<bool> s_active {false}; /**< Gates the hook until the sets are final */
 };
 
